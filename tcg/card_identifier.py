@@ -11,11 +11,52 @@ Enhanced path (optional): adds Ollama AI interpretation.
 
 import re
 import json
+import logging
+import time
 import cv2
 import numpy as np
 import pytesseract
-from concurrent.futures import ThreadPoolExecutor
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, asdict
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# eBay price LRU cache
+# ---------------------------------------------------------------------------
+
+_EBAY_CACHE_MAX = 500
+_EBAY_CACHE_TTL = 3600  # seconds
+
+# OrderedDict used as an LRU cache: key=(card_name_lower, set_name_lower)
+# value=(timestamp, listings)
+_ebay_cache: OrderedDict = OrderedDict()
+
+
+def _ebay_cache_get(card_name: str, set_name: str):
+    """Return cached listings or None if missing/expired."""
+    key = (card_name.lower(), set_name.lower())
+    entry = _ebay_cache.get(key)
+    if entry is None:
+        return None
+    ts, listings = entry
+    if time.time() - ts > _EBAY_CACHE_TTL:
+        del _ebay_cache[key]
+        return None
+    # Move to end (most-recently-used)
+    _ebay_cache.move_to_end(key)
+    return listings
+
+
+def _ebay_cache_set(card_name: str, set_name: str, listings: list):
+    """Store listings in the LRU cache, evicting oldest entry if at capacity."""
+    key = (card_name.lower(), set_name.lower())
+    if key in _ebay_cache:
+        _ebay_cache.move_to_end(key)
+    _ebay_cache[key] = (time.time(), listings)
+    while len(_ebay_cache) > _EBAY_CACHE_MAX:
+        _ebay_cache.popitem(last=False)
 
 
 @dataclass
@@ -35,6 +76,9 @@ class CardIdentity:
     raw_ocr: str = ""
     confidence: float = 0.0
     ai_description: str = ""
+    card_detected: bool = False
+    in_case: bool = False
+    case_type: str = ""      # "PSA slab", "BGS slab", "one-touch", "top loader", "penny sleeve", ""
 
 
 # ---------------------------------------------------------------------------
@@ -93,6 +137,387 @@ _ALL_TEAMS = _NFL_TEAMS + _NBA_TEAMS + _MLB_TEAMS
 
 # Thread pool for parallel OCR
 _ocr_pool = ThreadPoolExecutor(max_workers=4)
+
+# Grading service labels commonly found on slabs
+_SLAB_KEYWORDS = ["psa", "bgs", "sgc", "cgc", "bvg", "gma", "ags", "hga",
+                   "beckett", "gem mint", "gem-mt", "mint", "nm-mt", "authentic"]
+
+_CASE_KEYWORDS = ["ultra pro", "one-touch", "magnetic", "top loader",
+                   "card saver", "semi-rigid", "penny sleeve", "team bag"]
+
+
+# ---------------------------------------------------------------------------
+# Card presence detection
+# ---------------------------------------------------------------------------
+
+def detect_card_presence(img: np.ndarray) -> tuple[bool, np.ndarray | None]:
+    """
+    Detect if the image contains a card. Returns (found, contour).
+    A card is a roughly 2.5x3.5 aspect ratio rectangle (0.63-0.78 ratio).
+    """
+    h, w = img.shape[:2]
+
+    # Downscale for speed
+    scale = 1.0
+    if w > 800:
+        scale = 800 / w
+        small = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+    else:
+        small = img.copy()
+
+    gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(blur, 30, 120)
+    edges = cv2.dilate(edges, None, iterations=2)
+
+    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours = sorted(contours, key=cv2.contourArea, reverse=True)
+
+    sh, sw = small.shape[:2]
+    min_area = sh * sw * 0.05  # Card must be at least 5% of image
+
+    for cnt in contours[:15]:
+        area = cv2.contourArea(cnt)
+        if area < min_area:
+            continue
+
+        peri = cv2.arcLength(cnt, True)
+        approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
+
+        if len(approx) == 4:
+            # Check aspect ratio
+            rect = cv2.minAreaRect(cnt)
+            box_w, box_h = rect[1]
+            if box_w == 0 or box_h == 0:
+                continue
+            ratio = min(box_w, box_h) / max(box_w, box_h)
+            # Card ratio is ~0.714 (2.5/3.5), allow wider range for cases/slabs
+            if 0.45 < ratio < 0.85:
+                return True, (approx.astype(np.float32) / scale).astype(np.int32)
+
+        # Also accept rectangles detected via bounding rect
+        x, y, rw, rh = cv2.boundingRect(cnt)
+        if rw > 0 and rh > 0:
+            ratio = min(rw, rh) / max(rw, rh)
+            if 0.45 < ratio < 0.85 and area > min_area:
+                return True, cnt
+
+    return False, None
+
+
+# ---------------------------------------------------------------------------
+# Case / slab detection
+# ---------------------------------------------------------------------------
+
+def detect_case(img: np.ndarray) -> tuple[bool, str]:
+    """
+    Detect if a card is in a graded slab, case, or holder.
+    Returns (in_case, case_type).
+
+    Detection methods:
+    - Look for a thick rectangular border around the card (slab/holder)
+    - Look for label area above card (grading slab)
+    - Color analysis for plastic/acrylic sheen
+    - OCR the label area for grading company names
+    """
+    h, w = img.shape[:2]
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    # Method 1: Look for nested rectangles (outer = case, inner = card)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(blur, 30, 100)
+    edges = cv2.dilate(edges, None, iterations=2)
+
+    contours, hierarchy = cv2.findContours(edges, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    contours_sorted = sorted(contours, key=cv2.contourArea, reverse=True)
+
+    rect_contours = []
+    for cnt in contours_sorted[:20]:
+        peri = cv2.arcLength(cnt, True)
+        approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
+        if len(approx) == 4 and cv2.contourArea(cnt) > h * w * 0.03:
+            rect_contours.append(cnt)
+
+    # If we have 2+ nested rectangles, likely a case
+    nested = len(rect_contours) >= 2
+    if nested:
+        outer_area = cv2.contourArea(rect_contours[0])
+        inner_area = cv2.contourArea(rect_contours[1])
+        # The inner card should be 30-80% of the outer case
+        ratio = inner_area / outer_area if outer_area > 0 else 0
+        if not (0.25 < ratio < 0.85):
+            nested = False
+
+    # Method 2: Check top area for slab label (graded slabs have a label above the card)
+    top_region = img[0:int(h * 0.25), 0:w]
+    top_gray = cv2.cvtColor(top_region, cv2.COLOR_BGR2GRAY) if len(top_region.shape) == 3 else top_region
+
+    # Slab labels tend to be white/light with dark text
+    white_pct = np.mean(top_gray > 200)
+
+    # OCR the top region for grading company names
+    label_text = ""
+    try:
+        processed = cv2.threshold(top_gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+        label_text = pytesseract.image_to_string(processed, config="--psm 6 --oem 3").strip().lower()
+    except Exception:
+        pass
+
+    # Check for slab keywords
+    slab_found = ""
+    for kw in _SLAB_KEYWORDS:
+        if kw in label_text:
+            if kw in ("psa", "gem mint", "gem-mt", "mint", "nm-mt", "authentic"):
+                slab_found = "PSA slab"
+            elif kw in ("bgs", "beckett", "bvg"):
+                slab_found = "BGS slab"
+            elif kw == "sgc":
+                slab_found = "SGC slab"
+            elif kw == "cgc":
+                slab_found = "CGC slab"
+            elif kw in ("gma", "ags", "hga"):
+                slab_found = f"{kw.upper()} slab"
+            break
+
+    if slab_found:
+        return True, slab_found
+
+    # Check for case keywords in full OCR
+    for kw in _CASE_KEYWORDS:
+        if kw in label_text:
+            return True, kw.title()
+
+    # Method 3: Detect plastic sheen / thick borders
+    # Graded slabs have uniform color borders, look for that
+    if nested and white_pct > 0.3:
+        # Top region is mostly white/light + nested rectangles = likely a slab
+        return True, "graded slab"
+
+    # Method 4: Check for thick uniform borders (one-touch/top loader)
+    border_samples = [
+        gray[0:10, :],           # top edge
+        gray[h-10:h, :],        # bottom edge
+        gray[:, 0:10],          # left edge
+        gray[:, w-10:w],        # right edge
+    ]
+    border_stds = [np.std(b) for b in border_samples]
+    avg_border_std = np.mean(border_stds)
+    # Very uniform borders = plastic case
+    if avg_border_std < 15 and nested:
+        return True, "card holder"
+
+    return False, ""
+
+
+# ---------------------------------------------------------------------------
+# eBay search
+# ---------------------------------------------------------------------------
+
+def search_ebay_listings(card_name: str, year: str = "", set_name: str = "",
+                         card_number: str = "", game: str = "") -> list:
+    """Search eBay for listings of this card (LRU-cached, 10s timeout)."""
+    import requests as req
+
+    # Check cache first
+    cached = _ebay_cache_get(card_name, set_name)
+    if cached is not None:
+        return cached
+
+    # Build search query
+    parts = []
+    if card_name:
+        parts.append(card_name)
+    if year:
+        parts.append(year)
+    if set_name:
+        parts.append(set_name)
+    elif game and game not in card_name:
+        parts.append(game)
+    if card_number:
+        parts.append(f"#{card_number}")
+
+    query = " ".join(parts)
+    if not query.strip():
+        return []
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "Accept": "text/html",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+    }
+
+    listings = []
+    for domain in ["www.ebay.com", "www.ebay.co.uk"]:
+        try:
+            from urllib.parse import quote_plus
+            # LH_Complete=1 + LH_Sold=1 = sold listings only, _sop=13 = newest first
+            url = f"https://{domain}/sch/i.html?_nkw={quote_plus(query)}&_sacat=0&LH_Complete=1&LH_Sold=1&_sop=13"
+            r = req.get(url, headers=headers, timeout=10)
+            if r.status_code != 200 or len(r.text) < 5000:
+                continue
+
+            from bs4 import BeautifulSoup
+            soup = BeautifulSoup(r.text, "lxml")
+
+            # Try new eBay layout
+            for card_el in soup.select(".s-card")[:10]:
+                title_el = card_el.select_one(".s-card__title span, .s-card__title")
+                price_el = card_el.select_one(".s-card__price .s-price, .s-card__price")
+                link_el = card_el.select_one("a.s-card__link, a")
+                img_el = card_el.select_one("img")
+
+                title = title_el.get_text(strip=True) if title_el else ""
+                price = price_el.get_text(strip=True) if price_el else ""
+                link = link_el.get("href", "") if link_el else ""
+                img = img_el.get("src", "") if img_el else ""
+
+                if title and "shop on ebay" not in title.lower():
+                    listings.append({
+                        "title": title,
+                        "price": price,
+                        "url": link.split("?")[0] if link else "",
+                        "image": img,
+                        "source": domain,
+                    })
+
+            # Fallback to legacy layout
+            if not listings:
+                for item in soup.select("li.s-item")[:10]:
+                    title_el = item.select_one(".s-item__title span, .s-item__title")
+                    price_el = item.select_one(".s-item__price")
+                    link_el = item.select_one("a.s-item__link")
+                    img_el = item.select_one("img")
+
+                    title = title_el.get_text(strip=True) if title_el else ""
+                    price = price_el.get_text(strip=True) if price_el else ""
+                    link = link_el.get("href", "") if link_el else ""
+                    img = img_el.get("src", "") if img_el else ""
+
+                    if title and "shop on ebay" not in title.lower():
+                        listings.append({
+                            "title": title,
+                            "price": price,
+                            "url": link.split("?")[0] if link else "",
+                            "image": img,
+                            "source": domain,
+                        })
+
+            if listings:
+                break
+        except Exception as exc:
+            logger.error("eBay request failed for domain %s: %s", domain, exc)
+            continue
+
+    # Deduplicate
+    seen = set()
+    unique = []
+    for l in listings:
+        key = l.get("title", "")
+        if key not in seen:
+            seen.add(key)
+            unique.append(l)
+
+    result = unique[:10]
+    _ebay_cache_set(card_name, set_name, result)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Beckett price guide
+# ---------------------------------------------------------------------------
+
+def get_beckett_prices(card_name: str, year: str = "", set_name: str = "",
+                       game: str = "") -> dict:
+    """Scrape Beckett for price guide values."""
+    import requests as req
+    from urllib.parse import quote_plus
+
+    parts = []
+    if card_name:
+        parts.append(card_name)
+    if year:
+        parts.append(year)
+    if set_name:
+        parts.append(set_name)
+
+    query = " ".join(parts)
+    if not query.strip():
+        return {}
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "Accept": "text/html",
+    }
+
+    prices = {"source": "beckett", "query": query}
+
+    try:
+        url = f"https://www.beckett.com/search?term={quote_plus(query)}&type=cards"
+        r = req.get(url, headers=headers, timeout=10)
+        if r.status_code != 200:
+            prices["error"] = f"HTTP {r.status_code}"
+            return prices
+
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(r.text, "lxml")
+
+        results = []
+        for row in soup.select(".search-result-item, .item-row, tr.card-row, .listing-item")[:5]:
+            title_el = row.select_one(".item-title, .card-title, a, h4, td:first-child")
+            low_el = row.select_one(".price-low, .low, .beckett-price-low")
+            high_el = row.select_one(".price-high, .high, .beckett-price-high")
+
+            title = title_el.get_text(strip=True) if title_el else ""
+            low = low_el.get_text(strip=True) if low_el else ""
+            high = high_el.get_text(strip=True) if high_el else ""
+
+            if title:
+                results.append({"title": title, "low": low, "high": high})
+
+        prices["results"] = results
+
+        # Also try to find price data from page text
+        text = soup.get_text(" ", strip=True)
+        price_matches = re.findall(r'\$[\d,]+\.?\d*', text)
+        if price_matches and not results:
+            prices["prices_found"] = price_matches[:10]
+
+    except Exception as e:
+        logger.error("Beckett request failed: %s", e)
+        prices["error"] = str(e)
+
+    return prices
+
+
+# ---------------------------------------------------------------------------
+# Parallel price fetching
+# ---------------------------------------------------------------------------
+
+def fetch_all_prices(card_name: str, year: str = "", set_name: str = "",
+                     card_number: str = "", game: str = "") -> dict:
+    """
+    Fetch eBay and Beckett prices concurrently using ThreadPoolExecutor.
+    Returns {"ebay": [...], "beckett": {...}}.
+    """
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        fut_ebay = pool.submit(
+            search_ebay_listings, card_name, year, set_name, card_number, game
+        )
+        fut_beckett = pool.submit(
+            get_beckett_prices, card_name, year, set_name, game
+        )
+        results = {}
+        for label, fut in (("ebay", fut_ebay), ("beckett", fut_beckett)):
+            try:
+                results[label] = fut.result()
+            except Exception as exc:
+                logger.error("Price fetch failed for %s: %s", label, exc)
+                results[label] = [] if label == "ebay" else {}
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -307,12 +732,21 @@ def identify_card(img_data: bytes, use_ai: bool = False) -> CardIdentity:
         use_ai: If True, also call Ollama for enhanced identification (slower)
 
     Returns:
-        CardIdentity with all parsed fields
+        CardIdentity with all parsed fields including card_detected and in_case
     """
     arr = np.frombuffer(img_data, dtype=np.uint8)
     img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
     if img is None:
         raise ValueError("Could not decode image")
+
+    # Step 0: Detect if image contains a card at all
+    card_found, contour = detect_card_presence(img)
+
+    if not card_found:
+        return CardIdentity(card_detected=False, confidence=0.0)
+
+    # Step 0.5: Detect if card is in a case/slab
+    in_case, case_type = detect_case(img)
 
     # Step 1: Detect + warp card
     card = _fast_warp(img)
@@ -331,6 +765,24 @@ def identify_card(img_data: bytes, use_ai: bool = False) -> CardIdentity:
     if use_ai:
         ai_result = _ai_identify(ocr, category, game, parsed)
 
+    # Step 6: Determine confidence score
+    # AI overrides confidence when present and reliable
+    if ai_result.get("confidence"):
+        confidence = float(ai_result["confidence"])
+    else:
+        name_found = bool(parsed.get("name", "").strip())
+        card_number_found = bool(parsed.get("card_number", "").strip())
+        set_code_found = bool(parsed.get("set_code", "").strip())
+        # Exact match: name + at least one of card_number/set_code found
+        if name_found and (card_number_found or set_code_found):
+            confidence = 0.95
+        # Partial match: name found but no number/set anchor
+        elif name_found:
+            confidence = 0.70
+        # Fallback: no reliable name extracted
+        else:
+            confidence = 0.40
+
     # Build result — AI overrides where available
     return CardIdentity(
         name=ai_result.get("name", parsed.get("name", "")),
@@ -346,8 +798,11 @@ def identify_card(img_data: bytes, use_ai: bool = False) -> CardIdentity:
         team=ai_result.get("team", parsed.get("team", "")),
         language=ai_result.get("language", "English"),
         raw_ocr=ocr.get("full", "")[:1000],
-        confidence=ai_result.get("confidence", 0.6 if parsed.get("name") else 0.2),
+        confidence=confidence,
         ai_description=ai_result.get("description", ""),
+        card_detected=True,
+        in_case=in_case,
+        case_type=case_type,
     )
 
 
@@ -373,11 +828,11 @@ Respond ONLY with JSON:
             "messages": [{"role": "user", "content": prompt}],
             "stream": False,
             "options": {"temperature": 0.1, "num_predict": 300},
-        }, timeout=30)
+        }, timeout=10)
         ai_text = r.json().get("message", {}).get("content", "")
         m = re.search(r'\{[^{}]+\}', ai_text, re.DOTALL)
         if m:
             return json.loads(m.group(0))
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.error("AI identify request failed: %s", exc)
     return {}

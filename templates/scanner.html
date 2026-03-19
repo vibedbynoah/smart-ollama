@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>Card Scanner</title>
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background:#111; color:#fff; min-height:100vh; min-height:100dvh; }
+
+.app { max-width:600px; margin:0 auto; padding:12px; }
+
+h1 { font-size:1.3rem; text-align:center; padding:10px 0; color:#00d4ff; }
+h1 span { color:#888; font-weight:400; font-size:0.8rem; display:block; }
+
+/* Camera / Upload Area */
+.scanner-area {
+  position:relative; width:100%; aspect-ratio:3/4; background:#1a1a1a;
+  border-radius:16px; overflow:hidden; border:2px dashed #333;
+  display:flex; align-items:center; justify-content:center; cursor:pointer;
+  transition: border-color 0.3s;
+}
+.scanner-area.active { border-color:#00d4ff; }
+.scanner-area.has-image { border:none; }
+.scanner-area video, .scanner-area img { width:100%; height:100%; object-fit:cover; }
+.scanner-area .placeholder { text-align:center; color:#666; padding:20px; }
+.scanner-area .placeholder svg { width:64px; height:64px; fill:#444; margin-bottom:12px; }
+.scanner-area .placeholder p { font-size:0.95rem; }
+
+/* Buttons */
+.btn-row { display:flex; gap:8px; margin-top:12px; }
+.btn { flex:1; padding:14px; border:none; border-radius:12px; font-size:1rem; font-weight:600; cursor:pointer; transition:all 0.2s; }
+.btn-primary { background:#00d4ff; color:#000; }
+.btn-primary:active { background:#00a8cc; transform:scale(0.97); }
+.btn-secondary { background:#222; color:#fff; border:1px solid #333; }
+.btn-secondary:active { background:#333; }
+.btn:disabled { opacity:0.4; cursor:not-allowed; }
+
+/* Toggle row */
+.toggles { display:flex; gap:8px; margin-top:8px; flex-wrap:wrap; }
+.toggle { padding:8px 14px; border-radius:20px; font-size:0.8rem; border:1px solid #333; background:#1a1a1a; color:#aaa; cursor:pointer; }
+.toggle.on { border-color:#00d4ff; color:#00d4ff; background:#00d4ff15; }
+
+/* Loading */
+.loading { text-align:center; padding:30px; }
+.spinner { width:40px; height:40px; border:3px solid #333; border-top-color:#00d4ff; border-radius:50%; animation:spin 0.8s linear infinite; margin:0 auto 12px; }
+@keyframes spin { to { transform:rotate(360deg); } }
+
+/* Results */
+.results { margin-top:16px; }
+.result-card { background:#1a1a1a; border-radius:14px; padding:16px; margin-bottom:12px; }
+.result-card h2 { font-size:1.1rem; color:#00d4ff; margin-bottom:8px; }
+.result-card h3 { font-size:0.9rem; color:#888; margin:12px 0 6px; }
+
+.badge { display:inline-block; padding:4px 10px; border-radius:8px; font-size:0.75rem; font-weight:600; margin:2px; }
+.badge-green { background:#00ff8815; color:#00ff88; border:1px solid #00ff8833; }
+.badge-red { background:#ff444415; color:#ff4444; border:1px solid #ff444433; }
+.badge-blue { background:#00d4ff15; color:#00d4ff; border:1px solid #00d4ff33; }
+.badge-yellow { background:#ffaa0015; color:#ffaa00; border:1px solid #ffaa0033; }
+
+.info-grid { display:grid; grid-template-columns:1fr 1fr; gap:6px; }
+.info-item { padding:8px; background:#222; border-radius:8px; }
+.info-label { font-size:0.7rem; color:#666; text-transform:uppercase; }
+.info-value { font-size:0.9rem; color:#ddd; margin-top:2px; }
+
+/* Case message */
+.case-msg { padding:12px; border-radius:10px; font-size:0.95rem; font-weight:600; text-align:center; margin-top:8px; }
+.case-msg.in-case { background:#00ff8815; color:#00ff88; border:1px solid #00ff8833; }
+.case-msg.out-case { background:#ff444415; color:#ff4444; border:1px solid #ff444433; }
+
+/* eBay listings */
+.listing { display:flex; gap:10px; padding:10px; background:#222; border-radius:10px; margin-bottom:6px; text-decoration:none; color:#fff; }
+.listing:active { background:#333; }
+.listing img { width:60px; height:60px; object-fit:cover; border-radius:6px; flex-shrink:0; }
+.listing-info { flex:1; min-width:0; }
+.listing-title { font-size:0.8rem; color:#ddd; overflow:hidden; text-overflow:ellipsis; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; }
+.listing-price { font-size:1rem; font-weight:700; color:#00ff88; margin-top:4px; }
+.listing-sold { font-size:0.7rem; color:#888; }
+
+/* Beckett */
+.beckett-price { text-align:center; padding:16px; }
+.beckett-range { font-size:1.5rem; font-weight:700; color:#ffaa00; }
+
+/* No card */
+.no-card { text-align:center; padding:40px 20px; }
+.no-card svg { width:80px; height:80px; fill:#ff4444; margin-bottom:16px; }
+.no-card p { color:#888; font-size:1rem; }
+
+/* Responsive */
+@media (max-width: 400px) {
+  .app { padding:8px; }
+  .btn { padding:12px; font-size:0.9rem; }
+  .info-grid { grid-template-columns:1fr; }
+}
+@media (min-width: 768px) {
+  .app { padding:20px; }
+  .scanner-area { aspect-ratio:4/3; }
+}
+</style>
+</head>
+<body>
+<div class="app">
+  <h1>Card Scanner <span>Snap a card to identify + price it</span></h1>
+
+  <div class="scanner-area" id="scannerArea" onclick="document.getElementById('fileInput').click()">
+    <div class="placeholder" id="placeholder">
+      <svg viewBox="0 0 24 24"><path d="M12 15.2a3.2 3.2 0 1 0 0-6.4 3.2 3.2 0 0 0 0 6.4z"/><path d="M9 2 7.17 4H4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2h-3.17L15 2H9zm3 15a5 5 0 1 1 0-10 5 5 0 0 1 0 10z"/></svg>
+      <p>Tap to take a photo or upload</p>
+      <p style="font-size:0.8rem;color:#555;margin-top:6px">Supports TCG + Sports cards</p>
+    </div>
+    <img id="preview" style="display:none">
+    <video id="cameraFeed" style="display:none" autoplay playsinline></video>
+  </div>
+  <input type="file" id="fileInput" accept="image/*" capture="environment" style="display:none">
+
+  <div class="btn-row">
+    <button class="btn btn-primary" id="scanBtn" onclick="scanCard()">Scan Card</button>
+    <button class="btn btn-secondary" id="clearBtn" onclick="clearScan()" style="display:none">Clear</button>
+  </div>
+
+  <div class="toggles">
+    <div class="toggle on" id="togEbay" onclick="toggleOpt(this,'ebay')">eBay Sold</div>
+    <div class="toggle on" id="togBeckett" onclick="toggleOpt(this,'beckett')">Beckett</div>
+    <div class="toggle" id="togAi" onclick="toggleOpt(this,'ai')">AI Enhanced</div>
+  </div>
+
+  <div id="loading" class="loading" style="display:none">
+    <div class="spinner"></div>
+    <p>Scanning card...</p>
+  </div>
+
+  <div id="results" class="results"></div>
+</div>
+
+<script>
+const API_KEY = '{{API_KEY}}';
+const opts = { ebay: true, beckett: true, ai: false };
+let currentImage = null;
+
+document.getElementById('fileInput').addEventListener('change', function(e) {
+  const file = e.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = function(ev) {
+    currentImage = file;
+    const preview = document.getElementById('preview');
+    preview.src = ev.target.result;
+    preview.style.display = 'block';
+    document.getElementById('placeholder').style.display = 'none';
+    document.getElementById('scannerArea').classList.add('has-image');
+    document.getElementById('clearBtn').style.display = 'block';
+    document.getElementById('results').innerHTML = '';
+  };
+  reader.readAsDataURL(file);
+});
+
+function toggleOpt(el, key) {
+  opts[key] = !opts[key];
+  el.classList.toggle('on');
+}
+
+function clearScan() {
+  currentImage = null;
+  document.getElementById('preview').style.display = 'none';
+  document.getElementById('placeholder').style.display = 'block';
+  document.getElementById('scannerArea').classList.remove('has-image');
+  document.getElementById('clearBtn').style.display = 'none';
+  document.getElementById('results').innerHTML = '';
+  document.getElementById('fileInput').value = '';
+}
+
+async function scanCard() {
+  if (!currentImage) { document.getElementById('fileInput').click(); return; }
+
+  document.getElementById('loading').style.display = 'block';
+  document.getElementById('results').innerHTML = '';
+  document.getElementById('scanBtn').disabled = true;
+
+  const form = new FormData();
+  form.append('image', currentImage);
+
+  const params = new URLSearchParams();
+  if (opts.ai) params.set('ai', 'true');
+  if (opts.ebay) params.set('ebay', 'true');
+  else params.set('ebay', 'false');
+  if (opts.beckett) params.set('beckett', 'true');
+  else params.set('beckett', 'false');
+
+  try {
+    const resp = await fetch('/v1/identify-card?' + params.toString(), {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + API_KEY },
+      body: form,
+    });
+    const data = await resp.json();
+    renderResults(data);
+  } catch(e) {
+    document.getElementById('results').innerHTML = '<div class="result-card"><p style="color:#ff4444">Error: ' + e.message + '</p></div>';
+  }
+
+  document.getElementById('loading').style.display = 'none';
+  document.getElementById('scanBtn').disabled = false;
+}
+
+function renderResults(data) {
+  const el = document.getElementById('results');
+
+  if (!data.card_detected) {
+    el.innerHTML = '<div class="no-card"><svg viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/></svg><p>No card detected in image</p><p style="margin-top:8px;font-size:0.85rem;color:#666">Try taking a clearer photo with good lighting</p></div>';
+    return;
+  }
+
+  let html = '';
+  const c = data.card;
+
+  // Card info
+  html += '<div class="result-card">';
+  html += '<h2>' + (c.name || 'Unknown Card') + '</h2>';
+  html += '<div style="margin:6px 0">';
+  if (c.category) html += '<span class="badge badge-blue">' + c.category + '</span>';
+  if (c.game) html += '<span class="badge badge-blue">' + c.game + '</span>';
+  if (c.rarity) html += '<span class="badge badge-yellow">' + c.rarity + '</span>';
+  if (c.brand) html += '<span class="badge badge-blue">' + c.brand + '</span>';
+  html += '</div>';
+
+  html += '<div class="info-grid">';
+  if (c.year) html += '<div class="info-item"><div class="info-label">Year</div><div class="info-value">' + c.year + '</div></div>';
+  if (c.set_name || c.set_code) html += '<div class="info-item"><div class="info-label">Set</div><div class="info-value">' + (c.set_name || c.set_code) + '</div></div>';
+  if (c.card_number) html += '<div class="info-item"><div class="info-label">Number</div><div class="info-value">' + c.card_number + '</div></div>';
+  if (c.player) html += '<div class="info-item"><div class="info-label">Player</div><div class="info-value">' + c.player + '</div></div>';
+  if (c.team) html += '<div class="info-item"><div class="info-label">Team</div><div class="info-value">' + c.team + '</div></div>';
+  if (c.language) html += '<div class="info-item"><div class="info-label">Language</div><div class="info-value">' + c.language + '</div></div>';
+  html += '</div>';
+
+  // Confidence
+  html += '<div style="margin-top:8px"><span class="badge ' + (c.confidence > 0.6 ? 'badge-green' : 'badge-yellow') + '">' + Math.round(c.confidence * 100) + '% confidence</span></div>';
+  html += '</div>';
+
+  // Case detection
+  if (data.case) {
+    const cs = data.case;
+    html += '<div class="case-msg ' + (cs.in_case ? 'in-case' : 'out-case') + '">';
+    html += cs.message;
+    html += '</div>';
+  }
+
+  // Beckett prices
+  if (data.beckett && data.beckett.results && data.beckett.results.length) {
+    html += '<div class="result-card">';
+    html += '<h2>Beckett Price Guide</h2>';
+    for (const b of data.beckett.results.slice(0, 3)) {
+      html += '<div style="padding:8px;background:#222;border-radius:8px;margin-bottom:4px">';
+      html += '<div style="font-size:0.85rem;color:#ddd">' + b.title + '</div>';
+      if (b.low || b.high) html += '<div class="beckett-range">' + b.low + ' - ' + b.high + '</div>';
+      html += '</div>';
+    }
+    html += '</div>';
+  } else if (data.beckett && data.beckett.prices_found) {
+    html += '<div class="result-card">';
+    html += '<h2>Beckett Price Guide</h2>';
+    html += '<div class="beckett-range">' + data.beckett.prices_found.join(' / ') + '</div>';
+    html += '</div>';
+  }
+
+  // eBay sold listings
+  if (data.ebay_sold && data.ebay_sold.length) {
+    html += '<div class="result-card">';
+    html += '<h2>eBay Sold Prices</h2>';
+    for (const l of data.ebay_sold) {
+      html += '<a class="listing" href="' + l.url + '" target="_blank" rel="noopener">';
+      if (l.image) html += '<img src="' + l.image + '" alt="" loading="lazy">';
+      html += '<div class="listing-info">';
+      html += '<div class="listing-title">' + l.title + '</div>';
+      html += '<div class="listing-price">' + l.price + '</div>';
+      html += '<div class="listing-sold">SOLD · ' + l.source + '</div>';
+      html += '</div></a>';
+    }
+    html += '</div>';
+  }
+
+  // Elapsed
+  html += '<div style="text-align:center;padding:8px;color:#555;font-size:0.75rem">Scanned in ' + data.elapsed_seconds + 's</div>';
+
+  el.innerHTML = html;
+}
+</script>
+</body>
+</html>

@@ -7,14 +7,17 @@ Start:  python3 server.py
 API:    POST http://localhost:9000/v1/chat
 """
 
+import ast
 import json
 import re
 import os
 import math
+import hashlib
 import secrets
 import sqlite3
 import time
 import datetime
+import traceback
 from concurrent.futures import ThreadPoolExecutor
 from functools import wraps
 from urllib.parse import quote_plus
@@ -25,15 +28,18 @@ from bs4 import BeautifulSoup
 from flask import Flask, request, jsonify, Response, stream_with_context, g
 
 from tcg.cv_grader import grade_card_image
-from tcg.card_identifier import identify_card, CardIdentity
+from tcg.card_identifier import identify_card, CardIdentity, search_ebay_listings, get_beckett_prices
 from tcg.training import (
     init_training_tables, store_grade, submit_feedback,
     compute_corrections, build_correction_prompt, get_active_corrections,
     get_training_stats, run_training_cycle, start_trainer,
-    create_ollama_model, build_modelfile,
+    create_ollama_model, build_modelfile, mark_activity as _mark_trainer_activity,
 )
 
 app = Flask(__name__)
+
+SERVER_START_TIME = time.time()
+OLLAMA_TIMEOUT = 120  # seconds
 
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 DEFAULT_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5:0.5b")
@@ -46,6 +52,55 @@ SEARCH_HEADERS = {
     "Accept": "text/html",
     "Accept-Language": "en-US,en;q=0.9",
 }
+
+
+# ---------------------------------------------------------------------------
+# Request hooks — timing, CORS, global error handler
+# ---------------------------------------------------------------------------
+
+_active_requests = 0
+_last_request_at = 0.0
+_IDLE_THRESHOLD = 15  # seconds of no requests before training is allowed
+
+def is_server_idle():
+    return _active_requests == 0 and (time.time() - _last_request_at) > _IDLE_THRESHOLD
+
+@app.before_request
+def _set_request_start():
+    global _active_requests, _last_request_at
+    g.request_start = time.time()
+    _active_requests += 1
+    _last_request_at = time.time()
+    _mark_trainer_activity()
+
+
+@app.after_request
+def _add_headers(response):
+    global _active_requests
+    _active_requests = max(0, _active_requests - 1)
+    # CORS
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
+    # Response-time
+    elapsed_ms = round((time.time() - g.get("request_start", time.time())) * 1000, 1)
+    response.headers["X-Response-Time"] = f"{elapsed_ms}ms"
+    return response
+
+
+@app.errorhandler(Exception)
+def _handle_unhandled(e):
+    tb = traceback.format_exc()
+    print(f"[Unhandled Error] {e}\n{tb}")
+    return jsonify({"error": str(e)}), 500
+
+
+@app.route("/", methods=["OPTIONS"])
+@app.route("/<path:path>", methods=["OPTIONS"])
+def _options_preflight(path=""):
+    resp = jsonify({})
+    resp.status_code = 204
+    return resp
 
 # ---------------------------------------------------------------------------
 # DB
@@ -76,9 +131,84 @@ def init_db():
             elapsed REAL,
             created_at REAL NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS response_cache (
+            cache_key TEXT PRIMARY KEY,
+            response_json TEXT NOT NULL,
+            created_at REAL NOT NULL
+        );
     """)
     db.commit()
     db.close()
+
+
+# ---------------------------------------------------------------------------
+# Response cache (SHA256 of model+message+tools, 30-min TTL, non-streaming)
+# ---------------------------------------------------------------------------
+
+RESPONSE_CACHE_TTL = 1800  # 30 minutes
+
+def _response_cache_key(model: str, message: str, tools_used: list) -> str:
+    raw = f"{model}|{message}|{','.join(sorted(tools_used))}"
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def _get_response_cache(cache_key: str):
+    try:
+        db = get_db()
+        row = db.execute(
+            "SELECT response_json, created_at FROM response_cache WHERE cache_key=?",
+            (cache_key,),
+        ).fetchone()
+        db.close()
+        if row and (time.time() - row["created_at"]) < RESPONSE_CACHE_TTL:
+            return json.loads(row["response_json"])
+    except Exception:
+        pass
+    return None
+
+
+def _set_response_cache(cache_key: str, data: dict):
+    try:
+        db = get_db()
+        db.execute(
+            "INSERT OR REPLACE INTO response_cache (cache_key, response_json, created_at) VALUES (?,?,?)",
+            (cache_key, json.dumps(data), time.time()),
+        )
+        # Prune entries older than TTL
+        db.execute(
+            "DELETE FROM response_cache WHERE created_at < ?",
+            (time.time() - RESPONSE_CACHE_TTL,),
+        )
+        db.commit()
+        db.close()
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Model whitelist — fetched from Ollama /api/tags, cached 60 seconds
+# ---------------------------------------------------------------------------
+
+_model_whitelist: set = set()
+_model_whitelist_ts: float = 0.0
+_MODEL_CACHE_TTL = 60  # seconds
+
+
+def _get_available_models() -> set:
+    global _model_whitelist, _model_whitelist_ts
+    now = time.time()
+    if now - _model_whitelist_ts < _MODEL_CACHE_TTL and _model_whitelist:
+        return _model_whitelist
+    try:
+        r = requests.get(f"{OLLAMA_URL}/api/tags", timeout=3)
+        if r.status_code == 200:
+            names = {m["name"] for m in r.json().get("models", [])}
+            _model_whitelist = names
+            _model_whitelist_ts = now
+            return names
+    except Exception:
+        pass
+    return _model_whitelist  # return stale if fetch fails
 
 
 def gen_key():
@@ -136,8 +266,10 @@ def tool_web_search(query: str, num_results: int = 5) -> str:
             snippet = snippet_el.get_text(strip=True) if snippet_el else ""
             url = link_el.get("href", "") if link_el else ""
 
-            if title:
-                results.append(f"- {title}\n  {snippet}\n  {url}")
+            # Filter: require both title and snippet; truncate each result to 500 chars
+            if title and snippet:
+                entry = f"- {title}\n  {snippet}\n  {url}"
+                results.append(entry[:500])
 
         if not results:
             # Fallback: try Google
@@ -171,8 +303,10 @@ def tool_google_search(query: str, num_results: int = 5) -> str:
             snippet = snippet_el.get_text(strip=True) if snippet_el else ""
             url = link_el.get("href", "") if link_el else ""
 
-            if title:
-                results.append(f"- {title}\n  {snippet}\n  {url}")
+            # Filter: require both title and snippet; truncate each result to 500 chars
+            if title and snippet:
+                entry = f"- {title}\n  {snippet}\n  {url}"
+                results.append(entry[:500])
 
         return "\n\n".join(results) if results else "No results found."
     except Exception as e:
@@ -210,23 +344,50 @@ def tool_read_url(url: str) -> str:
         return f"URL fetch error: {e}"
 
 
+_SAFE_MATH_NAMES = {
+    "abs", "round", "min", "max", "pow",
+    "sqrt", "log", "log10", "sin", "cos", "tan",
+    "ceil", "floor", "pi", "e",
+}
+
+_SAFE_MATH_VALS = {
+    "abs": abs, "round": round, "min": min, "max": max, "pow": pow,
+    "sqrt": math.sqrt, "log": math.log, "log10": math.log10,
+    "sin": math.sin, "cos": math.cos, "tan": math.tan,
+    "ceil": math.ceil, "floor": math.floor,
+    "pi": math.pi, "e": math.e,
+}
+
+
+class _SafeMathVisitor(ast.NodeVisitor):
+    """Raise ValueError on any node that isn't a safe math construct."""
+    _ALLOWED_NODES = (
+        ast.Expression, ast.BinOp, ast.UnaryOp, ast.Call,
+        ast.Constant, ast.Add, ast.Sub, ast.Mul, ast.Div,
+        ast.Pow, ast.Mod, ast.FloorDiv, ast.UAdd, ast.USub,
+        ast.Load,
+    )
+
+    def visit(self, node):
+        if not isinstance(node, self._ALLOWED_NODES):
+            if isinstance(node, ast.Name):
+                if node.id not in _SAFE_MATH_NAMES:
+                    raise ValueError(f"Name '{node.id}' is not allowed")
+            else:
+                raise ValueError(f"Unsafe node type: {type(node).__name__}")
+        return self.generic_visit(node)
+
+
 def tool_calculate(expression: str) -> str:
-    """Evaluate a math expression safely."""
+    """Evaluate a math expression safely using AST parsing."""
     try:
-        # Allow basic math operations and functions
-        allowed = {
-            "abs": abs, "round": round, "min": min, "max": max,
-            "sum": sum, "len": len, "int": int, "float": float,
-            "pow": pow, "sqrt": math.sqrt, "log": math.log,
-            "log10": math.log10, "sin": math.sin, "cos": math.cos,
-            "tan": math.tan, "pi": math.pi, "e": math.e,
-            "ceil": math.ceil, "floor": math.floor,
-        }
-        # Sanitize
-        clean = re.sub(r'[^0-9+\-*/().,%^ a-zA-Z_]', '', expression)
-        clean = clean.replace("^", "**")
-        result = eval(clean, {"__builtins__": {}}, allowed)
+        expression = expression.replace("^", "**").strip()
+        tree = ast.parse(expression, mode="eval")
+        _SafeMathVisitor().visit(tree)
+        result = eval(compile(tree, "<expr>", "eval"), {"__builtins__": {}}, _SAFE_MATH_VALS)
         return str(result)
+    except ValueError as e:
+        return f"Calculation rejected: {e}"
     except Exception as e:
         return f"Calculation error: {e}"
 
@@ -323,8 +484,13 @@ def detect_tools(message: str) -> list[tuple[str, dict]]:
     return tools_to_run
 
 
+_SYNC_TOOLS = {"calculate", "datetime"}
+_ASYNC_TOOLS = {"web_search", "read_url", "weather"}
+
+
 def run_tools(tools_to_run: list[tuple[str, dict]]) -> dict[str, str]:
-    """Run tools concurrently and return results."""
+    """Run tools and return results.
+    Math/date tools run synchronously; web/fetch tools run in parallel."""
     results = {}
 
     def run_one(name, kwargs):
@@ -335,11 +501,21 @@ def run_tools(tools_to_run: list[tuple[str, dict]]) -> dict[str, str]:
         except Exception as e:
             return name, f"Error: {e}"
 
-    with ThreadPoolExecutor(max_workers=5) as pool:
-        futures = [pool.submit(run_one, name, kwargs) for name, kwargs in tools_to_run]
-        for future in futures:
-            name, result = future.result()
-            results[name] = result
+    # Split into sync (fast, no I/O) and async (network)
+    sync_tools = [(n, kw) for n, kw in tools_to_run if n in _SYNC_TOOLS]
+    async_tools = [(n, kw) for n, kw in tools_to_run if n in _ASYNC_TOOLS]
+    other_tools = [(n, kw) for n, kw in tools_to_run if n not in _SYNC_TOOLS and n not in _ASYNC_TOOLS]
+
+    for name, kwargs in sync_tools + other_tools:
+        name_out, result = run_one(name, kwargs)
+        results[name_out] = result
+
+    if async_tools:
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            futures = [pool.submit(run_one, name, kwargs) for name, kwargs in async_tools]
+            for future in futures:
+                name_out, result = future.result()
+                results[name_out] = result
 
     return results
 
@@ -395,7 +571,7 @@ def build_prompt(user_message: str, tool_results: dict[str, str], conversation: 
 # ---------------------------------------------------------------------------
 
 def call_ollama(messages: list[dict], model: str, stream: bool = False) -> str | Response:
-    """Call Ollama's chat API."""
+    """Call Ollama's chat API. Non-streaming retries up to 2 times on 503/connection errors."""
     payload = {
         "model": model,
         "messages": messages,
@@ -408,43 +584,104 @@ def call_ollama(messages: list[dict], model: str, stream: bool = False) -> str |
 
     if stream:
         def generate():
-            full_response = ""
             try:
                 r = requests.post(
                     f"{OLLAMA_URL}/api/chat",
                     json=payload,
                     stream=True,
-                    timeout=120,
+                    timeout=OLLAMA_TIMEOUT,
                 )
-                for line in r.iter_lines():
-                    if line:
-                        chunk = json.loads(line)
-                        token = chunk.get("message", {}).get("content", "")
-                        if token:
-                            full_response += token
-                            yield f"data: {json.dumps({'content': token})}\n\n"
-                        if chunk.get("done"):
-                            yield f"data: {json.dumps({'content': '', 'done': True})}\n\n"
+                try:
+                    for line in r.iter_lines():
+                        if line:
+                            chunk = json.loads(line)
+                            token = chunk.get("message", {}).get("content", "")
+                            if token:
+                                yield f"data: {json.dumps({'content': token})}\n\n"
+                            if chunk.get("done"):
+                                yield f"data: {json.dumps({'content': '', 'done': True})}\n\n"
+                except Exception:
+                    yield f"data: {json.dumps({'error': 'Stream interrupted'})}\n\n"
+            except requests.exceptions.Timeout:
+                yield f"data: {json.dumps({'error': 'Ollama request timed out after 120 seconds'})}\n\n"
             except Exception as e:
                 yield f"data: {json.dumps({'error': str(e)})}\n\n"
 
         return Response(stream_with_context(generate()), mimetype="text/event-stream")
     else:
-        try:
-            r = requests.post(
-                f"{OLLAMA_URL}/api/chat",
-                json=payload,
-                timeout=120,
-            )
-            data = r.json()
-            return data.get("message", {}).get("content", "No response from model")
-        except Exception as e:
-            return f"Ollama error: {e}"
+        last_err = None
+        for attempt in range(3):
+            try:
+                r = requests.post(
+                    f"{OLLAMA_URL}/api/chat",
+                    json=payload,
+                    timeout=OLLAMA_TIMEOUT,
+                )
+                if r.status_code == 503 and attempt < 2:
+                    time.sleep(1)
+                    last_err = f"Ollama returned 503"
+                    continue
+                data = r.json()
+                return data.get("message", {}).get("content", "No response from model")
+            except requests.exceptions.Timeout:
+                raise TimeoutError("Ollama request timed out after 120 seconds")
+            except requests.exceptions.ConnectionError as e:
+                last_err = str(e)
+                if attempt < 2:
+                    time.sleep(1)
+                    continue
+            except Exception as e:
+                return f"Ollama error: {e}"
+        raise TimeoutError(f"Ollama unreachable after 3 attempts: {last_err}")
 
 
 # ---------------------------------------------------------------------------
 # API Routes
 # ---------------------------------------------------------------------------
+
+@app.route("/scanner")
+def scanner_page():
+    """Mobile-responsive card scanner UI."""
+    db = get_db()
+    key_row = db.execute("SELECT key FROM api_keys LIMIT 1").fetchone()
+    db.close()
+    api_key = key_row["key"] if key_row else ""
+    with open(os.path.join(os.path.dirname(__file__), "templates", "scanner.html")) as f:
+        html = f.read().replace("{{API_KEY}}", api_key)
+    return html
+
+
+@app.route("/health")
+def health():
+    """GET /health — no auth required."""
+    uptime = round(time.time() - SERVER_START_TIME, 1)
+
+    # Try a quick ping to Ollama
+    ollama_reachable = False
+    model_names = []
+    try:
+        r = requests.get(f"{OLLAMA_URL}/api/tags", timeout=3)
+        if r.status_code == 200:
+            ollama_reachable = True
+            model_names = [m["name"] for m in r.json().get("models", [])]
+    except Exception:
+        pass
+
+    # DB size
+    db_size_bytes = 0
+    try:
+        db_size_bytes = os.path.getsize(DB_PATH)
+    except Exception:
+        pass
+
+    return jsonify({
+        "status": "ok",
+        "uptime_seconds": uptime,
+        "ollama_reachable": ollama_reachable,
+        "model_names": model_names,
+        "db_size_bytes": db_size_bytes,
+    })
+
 
 @app.route("/")
 def index():
@@ -458,7 +695,10 @@ def index():
         },
         "capabilities": ["web_search", "read_url", "calculate", "datetime", "weather", "tcg_grading"],
         "endpoints": {
+            "GET /health": "Health check (no auth required)",
             "POST /v1/chat": "Chat with the AI (supports web search, URL reading, math, etc.)",
+            "GET /v1/history": "Get last N chat messages from DB",
+            "DELETE /v1/history": "Clear conversation history for your API key",
             "POST /v1/identify-card": "Identify any card — TCG or sports (fast: ~80ms, ?ai=true for AI)",
             "POST /v1/grade-card": "Grade a TCG card image (multipart or base64)",
             "POST /v1/grade-feedback": "Submit actual grade for training",
@@ -502,20 +742,48 @@ def chat():
     else:
         model = model_choice  # Allow raw model names
 
+    # Model whitelist validation — reject unknown raw model names
+    if model_choice not in ("fast", "smart", "default"):
+        available = _get_available_models()
+        if available and model not in available:
+            return jsonify({
+                "error": f"Model '{model}' is not available. Available: {sorted(available)}",
+            }), 400
+
     conversation = data.get("conversation", [])
     stream = data.get("stream", False)
     use_tools = data.get("tools", True)
 
     t0 = time.time()
 
+    # Fast route: short messages with no tool keywords bypass tool detection
+    _TOOL_KEYWORDS = re.compile(
+        r"\b(search|look up|find|google|weather|calculate|compute|what is|who is|"
+        r"url|http|https|news|latest|price|today|time|date)\b",
+        re.IGNORECASE,
+    )
+    fast_route = (
+        use_tools
+        and len(user_message) < 50
+        and not _TOOL_KEYWORDS.search(user_message)
+    )
+
     # Detect and run tools
     tool_results = {}
     tools_used = []
-    if use_tools:
+    if use_tools and not fast_route:
         tools_to_run = detect_tools(user_message)
         if tools_to_run:
             tools_used = [t[0] for t in tools_to_run]
             tool_results = run_tools(tools_to_run)
+
+    # Non-streaming: check response cache before calling Ollama
+    if not stream:
+        cache_key = _response_cache_key(model, user_message, tools_used)
+        cached = _get_response_cache(cache_key)
+        if cached:
+            cached["cached"] = True
+            return jsonify(cached)
 
     # Build prompt with tool context
     messages = build_prompt(user_message, tool_results, conversation)
@@ -524,7 +792,10 @@ def chat():
     if stream:
         return call_ollama(messages, model, stream=True)
 
-    response_text = call_ollama(messages, model, stream=False)
+    try:
+        response_text = call_ollama(messages, model, stream=False)
+    except TimeoutError as e:
+        return jsonify({"error": str(e)}), 504
     elapsed = time.time() - t0
 
     # Log
@@ -536,13 +807,19 @@ def chat():
     db.commit()
     db.close()
 
-    return jsonify({
+    result = {
         "response": response_text,
         "model": model,
         "tools_used": tools_used,
         "tool_results": {k: v[:500] for k, v in tool_results.items()} if tool_results else None,
         "elapsed_seconds": round(elapsed, 2),
-    })
+        "cached": False,
+    }
+
+    # Store in response cache (non-streaming only)
+    _set_response_cache(cache_key, result)
+
+    return jsonify(result)
 
 
 @app.route("/v1/models", methods=["GET"])
@@ -583,6 +860,40 @@ def usage():
         "total_requests": key_row["requests_count"],
         "recent": [dict(r) for r in recent],
     })
+
+
+@app.route("/v1/history", methods=["GET"])
+@require_key
+def get_history():
+    """GET /v1/history — returns last N chat messages for this API key."""
+    limit = min(int(request.args.get("limit", 50)), 500)
+    db = get_db()
+    rows = db.execute(
+        "SELECT id, model, user_message, assistant_message, tools_used, elapsed, created_at "
+        "FROM chat_log WHERE api_key=? ORDER BY created_at DESC LIMIT ?",
+        (g.api_key, limit),
+    ).fetchall()
+    db.close()
+    messages = []
+    for r in rows:
+        row = dict(r)
+        try:
+            row["tools_used"] = json.loads(row["tools_used"] or "[]")
+        except Exception:
+            row["tools_used"] = []
+        messages.append(row)
+    return jsonify({"history": messages, "count": len(messages)})
+
+
+@app.route("/v1/history", methods=["DELETE"])
+@require_key
+def delete_history():
+    """DELETE /v1/history — clear all chat history for the current API key."""
+    db = get_db()
+    result = db.execute("DELETE FROM chat_log WHERE api_key=?", (g.api_key,))
+    db.commit()
+    db.close()
+    return jsonify({"deleted": result.rowcount, "api_key": g.api_key[:20] + "..."})
 
 
 @app.route("/v1/keys", methods=["POST"])
@@ -627,6 +938,11 @@ def grade_card():
             img_data = base64.b64decode(b64)
         except Exception:
             return jsonify({"error": "Invalid base64 image data"}), 400
+
+    # Step 1: verify this looks like a trading card before grading
+    card_ok, card_msg = _is_card_image(img_data)
+    if not card_ok:
+        return jsonify({"is_card": False, "message": card_msg}), 422
 
     # Run CV grading
     try:
@@ -724,6 +1040,55 @@ Provide your grading assessment as JSON."""
     })
 
 
+def _is_card_image(img_data):
+    """Check if img_data looks like a trading card.
+
+    Returns:
+        (True, "card detected") — proceed with grading
+        (False, message)        — reject; message is user-facing
+    """
+    # Fast aspect-ratio heuristic (no extra deps — Pillow already used elsewhere)
+    try:
+        from PIL import Image
+        import io as _io
+        img = Image.open(_io.BytesIO(img_data))
+        w, h = img.size
+        if w > 0 and h > 0:
+            ratio = min(w, h) / max(w, h)
+            # Standard card ratio ≈ 0.714 (2.5″ × 3.5″). Accept 0.58–0.82.
+            if 0.58 <= ratio <= 0.82:
+                return True, "card detected"
+            # Very square or very elongated — clearly not a card
+            if ratio > 0.95 or ratio < 0.38:
+                return False, "That doesn't look like a trading card. Please submit a clear photo of the front or back of a card."
+    except Exception:
+        pass
+
+    # Ambiguous or Pillow unavailable — ask llava for a quick yes/no
+    try:
+        b64 = base64.b64encode(img_data).decode()
+        r = requests.post(
+            f"{OLLAMA_URL}/api/generate",
+            json={
+                "model": "llava",
+                "prompt": "Is this image a trading card, sports card, or collectible card? Answer with only YES or NO.",
+                "images": [b64],
+                "stream": False,
+                "options": {"temperature": 0.0, "num_predict": 10, "num_ctx": 512},
+            },
+            timeout=15,
+        )
+        if r.status_code == 200:
+            text = r.json().get("response", "").strip().upper()
+            if text.startswith("NO"):
+                return False, "This does not appear to be a trading card."
+    except Exception:
+        pass
+
+    # Fail open — allow grading if we can't determine
+    return True, "card check skipped"
+
+
 def _psa_label(grade: float) -> str:
     """Convert numeric grade to PSA label."""
     labels = {
@@ -794,7 +1159,7 @@ def identify_card_route():
     POST /v1/identify-card
     Content-Type: multipart/form-data  (field: image)
     OR application/json  (field: image_base64)
-    Optional: ?ai=true for AI-enhanced identification (slower)
+    Optional: ?ai=true, ?ebay=true, ?beckett=true
     """
     t0 = time.time()
 
@@ -815,15 +1180,24 @@ def identify_card_route():
             return jsonify({"error": "Invalid base64 image data"}), 400
 
     use_ai = request.args.get("ai", "false").lower() in ("true", "1", "yes")
+    fetch_ebay = request.args.get("ebay", "true").lower() in ("true", "1", "yes")
+    fetch_beckett = request.args.get("beckett", "true").lower() in ("true", "1", "yes")
 
     try:
         result = identify_card(img_data, use_ai=use_ai)
     except Exception as e:
         return jsonify({"error": f"Identification failed: {e}"}), 500
 
-    elapsed = time.time() - t0
+    # No card detected
+    if not result.card_detected:
+        return jsonify({
+            "card_detected": False,
+            "message": "No card detected in image",
+            "elapsed_seconds": round(time.time() - t0, 4),
+        })
 
-    return jsonify({
+    resp = {
+        "card_detected": True,
         "card": {
             "name": result.name,
             "category": result.category,
@@ -840,10 +1214,30 @@ def identify_card_route():
             "confidence": result.confidence,
             "description": result.ai_description,
         },
+        "case": {
+            "in_case": result.in_case,
+            "case_type": result.case_type,
+            "message": f"Card is in a {result.case_type}" if result.in_case else "Out of the case",
+        },
         "raw_ocr": result.raw_ocr,
         "ai_enhanced": use_ai,
-        "elapsed_seconds": round(elapsed, 4),
-    })
+    }
+
+    # eBay sold listings
+    if fetch_ebay and result.name:
+        resp["ebay_sold"] = search_ebay_listings(
+            result.name, result.year, result.set_name,
+            result.card_number, result.game
+        )
+
+    # Beckett prices
+    if fetch_beckett and result.name:
+        resp["beckett"] = get_beckett_prices(
+            result.name, result.year, result.set_name, result.game
+        )
+
+    resp["elapsed_seconds"] = round(time.time() - t0, 4)
+    return jsonify(resp)
 
 
 # ---------------------------------------------------------------------------
@@ -893,5 +1287,6 @@ if __name__ == "__main__":
     print(f"  Smart model:   {SMART_MODEL}")
     print(f"  Fast model:    {FAST_MODEL}")
     print(f"  TCG model:     tcg-grader")
-    print(f"\n  Smart Ollama API running on http://localhost:9000\n")
-    app.run(port=9000, debug=False)
+    port = int(os.environ.get("PORT", 9000))
+    print(f"\n  Smart Ollama API running on http://localhost:{port}\n")
+    app.run(port=port, debug=False, threaded=True)

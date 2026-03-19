@@ -163,6 +163,56 @@ def warp_card(img: np.ndarray, contour: np.ndarray) -> np.ndarray:
     return warped
 
 
+def detect_slab(img: np.ndarray) -> bool:
+    """Detect if the image shows a graded card inside a slab holder."""
+    h, w = img.shape[:2]
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    # Sample the outer border pixels (10% band on each side)
+    top_band    = gray[0:h//10, :]
+    bottom_band = gray[9*h//10:h, :]
+    left_band   = gray[:, 0:w//10]
+    right_band  = gray[:, 9*w//10:w]
+    border_mean = np.mean([top_band.mean(), bottom_band.mean(),
+                           left_band.mean(), right_band.mean()])
+    center_crop = gray[h//4:3*h//4, w//4:3*w//4]
+    center_mean = center_crop.mean()
+    # Slab images have a bright/uniform outer border and a complex inner card
+    border_is_bright = border_mean > 200
+    center_is_complex = center_crop.std() > 30
+    return bool(border_is_bright and center_is_complex)
+
+
+def crop_inner_card(img: np.ndarray) -> np.ndarray:
+    """For slab images: crop out the uniform slab border to isolate the card."""
+    h, w = img.shape[:2]
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    # Find the largest non-white contiguous region
+    _, binary = cv2.threshold(gray, 230, 255, cv2.THRESH_BINARY_INV)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
+    closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+    contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        # Fall back: crop 12% from each side
+        pad_y = int(h * 0.12)
+        pad_x = int(w * 0.12)
+        return img[pad_y:h-pad_y, pad_x:w-pad_x]
+    # Use the bounding box of the largest contour
+    largest = max(contours, key=cv2.contourArea)
+    x, y, cw, ch = cv2.boundingRect(largest)
+    # Add small inset to avoid slab border artefacts
+    inset_x = max(0, int(cw * 0.04))
+    inset_y = max(0, int(ch * 0.04))
+    x1 = max(0, x + inset_x)
+    y1 = max(0, y + inset_y)
+    x2 = min(w, x + cw - inset_x)
+    y2 = min(h, y + ch - inset_y)
+    if x2 - x1 < 50 or y2 - y1 < 50:
+        pad_y = int(h * 0.12)
+        pad_x = int(w * 0.12)
+        return img[pad_y:h-pad_y, pad_x:w-pad_x]
+    return img[y1:y2, x1:x2]
+
+
 # ---------------------------------------------------------------------------
 # Centering analysis
 # ---------------------------------------------------------------------------
@@ -177,7 +227,7 @@ def analyze_centering(card: np.ndarray) -> CenteringDetail:
 
     # Find the bounding box of the non-border content
     # Sample rows/cols to find where content starts
-    border_threshold = 240  # Near-white = border
+    border_threshold = 220  # Near-white = border
 
     def find_border(line, from_start=True):
         """Find where border ends in a 1D intensity profile."""
@@ -474,10 +524,10 @@ def analyze_surface(card: np.ndarray) -> SurfaceDetail:
     # 3. Whitening / fading areas
     hsv = cv2.cvtColor(interior, cv2.COLOR_BGR2HSV)
     saturation = hsv[:, :, 1]
-    low_sat_mask = (saturation < 30).astype(np.uint8) * 255
+    low_sat_mask = (saturation < 20).astype(np.uint8) * 255
     # Exclude naturally white areas by checking if value is also high
     value = hsv[:, :, 2]
-    whitening_mask = cv2.bitwise_and(low_sat_mask, (value > 200).astype(np.uint8) * 255)
+    whitening_mask = cv2.bitwise_and(low_sat_mask, (value > 215).astype(np.uint8) * 255)
     whitening_ratio = cv2.countNonZero(whitening_mask) / max(1, ih * iw)
 
     contours_w, _ = cv2.findContours(whitening_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -552,6 +602,11 @@ def grade_card_image(img_data: bytes) -> GradeResult:
 
     h, w = img.shape[:2]
 
+    # Detect slab and extract inner card first
+    is_slab = detect_slab(img)
+    if is_slab:
+        img = crop_inner_card(img)
+
     # Try to detect and extract card
     contour = detect_card(img)
     if contour is not None and len(contour) == 4:
@@ -614,6 +669,7 @@ def grade_card_image(img_data: bytes) -> GradeResult:
         "image_size": f"{w}x{h}",
         "card_size": f"{cw}x{ch}",
         "card_detected": card_detected,
+        "is_slab": is_slab,
     }
 
     return GradeResult(

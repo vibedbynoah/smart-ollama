@@ -17,7 +17,7 @@ from dataclasses import asdict
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "..", "smart_ollama.db")
 MODELFILE_PATH = os.path.join(os.path.dirname(__file__), "Modelfile.tcg")
-TRAINING_INTERVAL = 900  # 15 minutes
+TRAINING_INTERVAL = 300  # 5 minutes
 
 
 def get_db():
@@ -159,6 +159,25 @@ def compute_corrections() -> list[dict]:
                         "confidence": min(0.9, len(diffs) / 10),
                         "sample_size": len(diffs),
                     })
+
+    # Per-grade-bucket corrections (high-grade cards behave differently)
+    for bucket, (grade_min, grade_max) in [
+        ("high", (8.5, 10.5)), ("mid", (5.5, 8.4)), ("low", (0, 5.4))
+    ]:
+        bucket_rows = [r for r in labeled
+                       if r["actual_overall"] and grade_min <= r["actual_overall"] <= grade_max
+                       and r["ai_overall"]]
+        if len(bucket_rows) >= 3:
+            diffs = [r["ai_overall"] - r["actual_overall"] for r in bucket_rows]
+            bias = statistics.mean(diffs)
+            if abs(bias) > 0.2:
+                corrections.append({
+                    "rule_type": f"grade_range_bias_{bucket}",
+                    "description": f"For {bucket}-grade cards ({grade_min:.0f}-{grade_max:.0f}), AI is off by {bias:+.2f}",
+                    "adjustment": -bias,
+                    "confidence": min(0.9, len(bucket_rows) / 10),
+                    "sample_size": len(bucket_rows),
+                })
 
     # Per-subgrade corrections
     for subgrade in ["centering", "corners", "edges", "surface"]:
@@ -355,6 +374,28 @@ def run_training_cycle():
     db.commit()
     db.close()
 
+    # Compute MAE before and after corrections
+    db = get_db()
+    labeled_rows = db.execute(
+        "SELECT ai_overall, actual_overall FROM tcg_grades WHERE ai_overall IS NOT NULL AND actual_overall IS NOT NULL"
+    ).fetchall()
+    db.close()
+    if labeled_rows:
+        raw_errors = [abs(r["ai_overall"] - r["actual_overall"]) for r in labeled_rows]
+        mae_before = statistics.mean(raw_errors)
+        # After correction: apply the primary bias correction
+        primary_adj = next((c["adjustment"] for c in corrections if c["rule_type"] == "ai_overall_bias"), 0)
+        corrected_errors = [abs((r["ai_overall"] + primary_adj) - r["actual_overall"]) for r in labeled_rows]
+        mae_after = statistics.mean(corrected_errors)
+        # Update the training run record with MAE
+        db2 = get_db()
+        db2.execute(
+            "UPDATE tcg_training_runs SET mae_before=?, mae_after=? WHERE id=(SELECT MAX(id) FROM tcg_training_runs)",
+            (mae_before, mae_after)
+        )
+        db2.commit()
+        db2.close()
+
     return {
         "entries_processed": total,
         "labeled_entries": labeled,
@@ -395,14 +436,30 @@ def get_training_stats() -> dict:
 _trainer_thread = None
 _trainer_running = False
 
+# Shared idle check — server.py calls mark_activity(); trainer checks is_idle()
+_last_activity = 0.0
+_IDLE_THRESHOLD = 15  # seconds
+
+
+def mark_activity():
+    global _last_activity
+    _last_activity = time.time()
+
+
+def is_idle():
+    return (time.time() - _last_activity) > _IDLE_THRESHOLD
+
 
 def _trainer_loop():
     global _trainer_running
     while _trainer_running:
         try:
-            result = run_training_cycle()
-            print(f"[TCG Trainer] Cycle complete: {result['entries_processed']} entries, "
-                  f"{result['labeled_entries']} labeled, {len(result['corrections'])} corrections")
+            if not is_idle():
+                print("[TCG Trainer] Skipping — server is active")
+            else:
+                result = run_training_cycle()
+                print(f"[TCG Trainer] Cycle complete: {result['entries_processed']} entries, "
+                      f"{result['labeled_entries']} labeled, {len(result['corrections'])} corrections")
         except Exception as e:
             print(f"[TCG Trainer] Error: {e}")
         time.sleep(TRAINING_INTERVAL)
@@ -415,7 +472,7 @@ def start_trainer():
     _trainer_running = True
     _trainer_thread = threading.Thread(target=_trainer_loop, daemon=True)
     _trainer_thread.start()
-    print("[TCG Trainer] Background training started (every 15 min)")
+    print("[TCG Trainer] Background training started (every 5 min, idle-only)")
 
 
 def stop_trainer():
