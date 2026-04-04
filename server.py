@@ -6,6 +6,10 @@ calculations, date/time, and chain-of-thought reasoning.
 Start:  python3 server.py
 API:    POST http://localhost:9000/v1/chat
 """
+import sys as _sys, os as _os
+_sys.path.insert(0, _os.path.expanduser('~'))
+from load_env import load_dev_vars as _lenv; _lenv()
+del _sys, _os, _lenv
 
 import ast
 import json
@@ -42,9 +46,9 @@ SERVER_START_TIME = time.time()
 OLLAMA_TIMEOUT = 120  # seconds
 
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
-DEFAULT_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5:0.5b")
-FAST_MODEL = os.environ.get("OLLAMA_FAST_MODEL", "qwen2.5:0.5b")
-SMART_MODEL = os.environ.get("OLLAMA_SMART_MODEL", "llama3.2:1b")
+DEFAULT_MODEL = os.environ.get("OLLAMA_MODEL", "moondream:latest")
+FAST_MODEL = os.environ.get("OLLAMA_FAST_MODEL", "moondream:latest")
+SMART_MODEL = os.environ.get("OLLAMA_SMART_MODEL", "deepseek-r1:7b")
 DB_PATH = os.path.join(os.path.dirname(__file__), "smart_ollama.db")
 
 SEARCH_HEADERS = {
@@ -363,7 +367,7 @@ class _SafeMathVisitor(ast.NodeVisitor):
     """Raise ValueError on any node that isn't a safe math construct."""
     _ALLOWED_NODES = (
         ast.Expression, ast.BinOp, ast.UnaryOp, ast.Call,
-        ast.Constant, ast.Add, ast.Sub, ast.Mul, ast.Div,
+        ast.Constant, ast.Add, ast.Sub, ast.Mult, ast.Div,
         ast.Pow, ast.Mod, ast.FloorDiv, ast.UAdd, ast.USub,
         ast.Load,
     )
