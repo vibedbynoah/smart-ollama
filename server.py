@@ -28,8 +28,23 @@ from urllib.parse import quote_plus
 
 import base64
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from bs4 import BeautifulSoup
 from flask import Flask, request, jsonify, Response, stream_with_context, g
+
+# Shared personalization + tool registry
+try:
+    from user_profile import get_profile
+    from tool_registry import TOOLS, execute_tool, run_with_tools, build_tool_system_prompt
+    _PROFILE_AVAILABLE = True
+except ImportError:
+    _PROFILE_AVAILABLE = False
+    def get_profile(): return None
+    TOOLS = []
+    def execute_tool(n, a): return ""
+    def run_with_tools(msgs, model, **kw): return "", msgs
+    def build_tool_system_prompt(s=""): return s
 
 from tcg.cv_grader import grade_card_image
 from tcg.card_identifier import identify_card, CardIdentity, search_ebay_listings, get_beckett_prices
@@ -41,14 +56,56 @@ from tcg.training import (
 )
 
 app = Flask(__name__)
+from stats_logger import attach_stats_middleware
 
 SERVER_START_TIME = time.time()
+
+# ---------------------------------------------------------------------------
+# Topic inference for personalization
+# ---------------------------------------------------------------------------
+
+_TOPIC_PATTERNS = {
+    "trading cards": r"\b(card|tcg|pokemon|yugioh|mtg|psa|bgs|grade|slab|pack|pull)\b",
+    "pricing": r"\b(price|cost|worth|value|sell|buy|market|ebay)\b",
+    "sports": r"\b(nba|nfl|mlb|nhl|football|basketball|baseball|soccer|sport)\b",
+    "technology": r"\b(code|programming|python|software|api|server|docker|linux)\b",
+    "investing": r"\b(invest|portfolio|stock|profit|roi|flip)\b",
+    "gaming": r"\b(game|gaming|playstation|xbox|nintendo|steam|rpg)\b",
+}
+
+def _infer_topics(text: str) -> list[str]:
+    """Infer topic labels from a message for personalization tracking."""
+    import re as _re
+    text_lower = text.lower()
+    return [
+        topic for topic, pattern in _TOPIC_PATTERNS.items()
+        if _re.search(pattern, text_lower)
+    ]
 OLLAMA_TIMEOUT = 120  # seconds
 
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
-DEFAULT_MODEL = os.environ.get("OLLAMA_MODEL", "moondream:latest")
-FAST_MODEL = os.environ.get("OLLAMA_FAST_MODEL", "moondream:latest")
-SMART_MODEL = os.environ.get("OLLAMA_SMART_MODEL", "deepseek-r1:7b")
+OLLAMA_CLOUD_URL = os.environ.get("OLLAMA_CLOUD_URL", "https://ollama.com/api")
+OLLAMA_API_KEY = os.environ.get("OLLAMA_API_KEY", "")
+VLLM_VISION_URL = os.environ.get("VLLM_VISION_URL", "http://localhost:8000/v1")
+VLLM_VISION_MODEL = os.environ.get("VLLM_VISION_MODEL", "OpenGVLab/InternVL2-26B")
+
+# Model defaults
+DEFAULT_MODEL = os.environ.get("OLLAMA_MODEL", "deepseek-r1:7b")
+FAST_MODEL = os.environ.get("OLLAMA_FAST_MODEL", "qwen3:1.7b")
+SMART_MODEL = os.environ.get("OLLAMA_SMART_MODEL", "minimax-m2.5:cloud")
+VISION_LOCAL_MODEL = os.environ.get("OLLAMA_VISION_MODEL", "qwen2.5vl:7b")
+
+# Groq — fast cloud reasoning fallback
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+
+# Cerebras — primary cloud reasoning (235B MoE, extremely fast + capable)
+CEREBRAS_API_KEY = os.environ.get("CEREBRAS_API_KEY", "")
+CEREBRAS_MODEL_LARGE = os.environ.get("CEREBRAS_MODEL_LARGE", "qwen-3-235b-a22b-instruct-2507")
+CEREBRAS_MODEL_FAST = os.environ.get("CEREBRAS_MODEL_FAST", "llama3.1-8b")
+CEREBRAS_URL = "https://api.cerebras.ai/v1/chat/completions"
+
 DB_PATH = os.path.join(os.path.dirname(__file__), "smart_ollama.db")
 
 SEARCH_HEADERS = {
@@ -56,6 +113,35 @@ SEARCH_HEADERS = {
     "Accept": "text/html",
     "Accept-Language": "en-US,en;q=0.9",
 }
+
+# ---------------------------------------------------------------------------
+# Connection pooling — one session per backend
+# ---------------------------------------------------------------------------
+
+def _make_session(retries: int = 2, backoff: float = 0.5) -> requests.Session:
+    """Create a requests.Session with retry logic and connection pooling."""
+    session = requests.Session()
+    retry = Retry(
+        total=retries,
+        backoff_factor=backoff,
+        status_forcelist=[502, 503, 504],
+        allowed_methods=["GET", "POST"],
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(
+        max_retries=retry,
+        pool_connections=4,
+        pool_maxsize=16,
+    )
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
+# Shared sessions — reused across requests for connection pooling
+_ollama_session = _make_session()          # local Ollama
+_cloud_session = _make_session()           # Ollama cloud API
+_vllm_session = _make_session()            # vllm InternVL2
+_web_session = _make_session(retries=1)    # web scraping / weather
 
 
 # ---------------------------------------------------------------------------
@@ -123,7 +209,8 @@ def init_db():
             key TEXT PRIMARY KEY,
             name TEXT NOT NULL,
             created_at REAL NOT NULL,
-            requests_count INTEGER DEFAULT 0
+            requests_count INTEGER DEFAULT 0,
+            tier TEXT NOT NULL DEFAULT 'free'
         );
         CREATE TABLE IF NOT EXISTS chat_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -142,6 +229,12 @@ def init_db():
         );
     """)
     db.commit()
+    # Safe migration: add tier column to existing deployments
+    try:
+        db.execute("ALTER TABLE api_keys ADD COLUMN tier TEXT NOT NULL DEFAULT 'free'")
+        db.commit()
+    except Exception:
+        pass  # Column already exists
     db.close()
 
 
@@ -204,7 +297,7 @@ def _get_available_models() -> set:
     if now - _model_whitelist_ts < _MODEL_CACHE_TTL and _model_whitelist:
         return _model_whitelist
     try:
-        r = requests.get(f"{OLLAMA_URL}/api/tags", timeout=3)
+        r = _ollama_session.get(f"{OLLAMA_URL}/api/tags", timeout=3)
         if r.status_code == 200:
             names = {m["name"] for m in r.json().get("models", [])}
             _model_whitelist = names
@@ -238,9 +331,13 @@ def require_key(f):
         db.execute("UPDATE api_keys SET requests_count = requests_count + 1 WHERE key=?", (key,))
         db.commit()
         g.api_key = key
+        g.user_tier = dict(row).get("tier", "free")
         db.close()
         return f(*args, **kwargs)
     return decorated
+
+# Alias so profile/tools endpoints (which use @require_auth) work identically
+require_auth = require_key
 
 
 # ---------------------------------------------------------------------------
@@ -248,9 +345,23 @@ def require_key(f):
 # ---------------------------------------------------------------------------
 
 def tool_web_search(query: str, num_results: int = 5) -> str:
-    """Search the web via DuckDuckGo and return results."""
+    """Search the web via DuckDuckGo with Google fallback."""
+    # --- Primary: DuckDuckGo HTML ---
+    ddg_result = _duckduckgo_search(query, num_results)
+    if ddg_result and not ddg_result.startswith("Search"):
+        return ddg_result
+    # --- Fallback: Google ---
+    google_result = tool_google_search(query, num_results)
+    if google_result and not google_result.startswith("Google search"):
+        return google_result
+    # --- Last resort: DuckDuckGo API (lite JSON endpoint) ---
+    return _duckduckgo_api_search(query, num_results)
+
+
+def _duckduckgo_search(query: str, num_results: int = 5) -> str:
+    """DuckDuckGo HTML scrape."""
     try:
-        r = requests.get(
+        r = _web_session.get(
             "https://html.duckduckgo.com/html/",
             params={"q": query},
             headers=SEARCH_HEADERS,
@@ -270,24 +381,48 @@ def tool_web_search(query: str, num_results: int = 5) -> str:
             snippet = snippet_el.get_text(strip=True) if snippet_el else ""
             url = link_el.get("href", "") if link_el else ""
 
-            # Filter: require both title and snippet; truncate each result to 500 chars
             if title and snippet:
                 entry = f"- {title}\n  {snippet}\n  {url}"
                 results.append(entry[:500])
 
-        if not results:
-            # Fallback: try Google
-            return tool_google_search(query, num_results)
-
-        return "\n\n".join(results)
+        return "\n\n".join(results) if results else ""
     except Exception as e:
         return f"Search error: {e}"
+
+
+def _duckduckgo_api_search(query: str, num_results: int = 5) -> str:
+    """DuckDuckGo Lite JSON API — no key needed, good fallback."""
+    try:
+        r = _web_session.get(
+            "https://api.duckduckgo.com/",
+            params={"q": query, "format": "json", "no_redirect": "1", "no_html": "1"},
+            headers=SEARCH_HEADERS,
+            timeout=10,
+        )
+        if r.status_code != 200:
+            return "No results found."
+        data = r.json()
+        results = []
+        # Abstract answer
+        abstract = data.get("AbstractText", "")
+        abstract_url = data.get("AbstractURL", "")
+        if abstract:
+            results.append(f"- {abstract}\n  {abstract_url}")
+        # Related topics
+        for topic in data.get("RelatedTopics", [])[:num_results]:
+            text = topic.get("Text", "")
+            url = topic.get("FirstURL", "")
+            if text:
+                results.append(f"- {text[:400]}\n  {url}")
+        return "\n\n".join(results) if results else "No results found."
+    except Exception as e:
+        return f"Search API error: {e}"
 
 
 def tool_google_search(query: str, num_results: int = 5) -> str:
     """Fallback search via Google."""
     try:
-        r = requests.get(
+        r = _web_session.get(
             "https://www.google.com/search",
             params={"q": query, "num": str(num_results)},
             headers=SEARCH_HEADERS,
@@ -307,12 +442,11 @@ def tool_google_search(query: str, num_results: int = 5) -> str:
             snippet = snippet_el.get_text(strip=True) if snippet_el else ""
             url = link_el.get("href", "") if link_el else ""
 
-            # Filter: require both title and snippet; truncate each result to 500 chars
             if title and snippet:
                 entry = f"- {title}\n  {snippet}\n  {url}"
                 results.append(entry[:500])
 
-        return "\n\n".join(results) if results else "No results found."
+        return "\n\n".join(results) if results else ""
     except Exception as e:
         return f"Google search error: {e}"
 
@@ -320,7 +454,7 @@ def tool_google_search(query: str, num_results: int = 5) -> str:
 def tool_read_url(url: str) -> str:
     """Fetch a URL and extract the main text content."""
     try:
-        r = requests.get(url, headers=SEARCH_HEADERS, timeout=10)
+        r = _web_session.get(url, headers=SEARCH_HEADERS, timeout=10)
         if r.status_code != 200:
             return f"Failed to fetch URL (HTTP {r.status_code})"
 
@@ -406,7 +540,7 @@ def tool_datetime() -> str:
 def tool_weather(location: str) -> str:
     """Get current weather for a location."""
     try:
-        r = requests.get(f"https://wttr.in/{quote_plus(location)}?format=j1", timeout=10)
+        r = _web_session.get(f"https://wttr.in/{quote_plus(location)}?format=j1", timeout=10)
         if r.status_code != 200:
             return f"Weather fetch failed (HTTP {r.status_code})"
         data = r.json()
@@ -424,7 +558,7 @@ def tool_weather(location: str) -> str:
         return f"Weather error: {e}"
 
 
-TOOLS = {
+_LOCAL_TOOLS = {
     "web_search": tool_web_search,
     "read_url": tool_read_url,
     "calculate": tool_calculate,
@@ -498,7 +632,7 @@ def run_tools(tools_to_run: list[tuple[str, dict]]) -> dict[str, str]:
     results = {}
 
     def run_one(name, kwargs):
-        fn = TOOLS[name]
+        fn = _LOCAL_TOOLS[name]
         try:
             result = fn(**kwargs)
             return name, result
@@ -541,9 +675,20 @@ Rules:
 - When citing information from search results, be specific"""
 
 
-def build_prompt(user_message: str, tool_results: dict[str, str], conversation: list[dict]) -> str:
-    """Build the full prompt with tool results injected as context."""
+def build_prompt(user_message: str, tool_results: dict[str, str], conversation: list[dict]) -> list[dict]:
+    """Build the full prompt with tool results and personalized user context injected."""
     parts = [SYSTEM_PROMPT]
+
+    # Inject personalized user context
+    if _PROFILE_AVAILABLE:
+        profile = get_profile()
+        user_ctx = profile.system_context(service="smart-ollama") if profile else ""
+        if user_ctx:
+            parts.append(f"\n{user_ctx}")
+
+    # Add tool capabilities description for models without native tool support
+    if _PROFILE_AVAILABLE:
+        parts.append(build_tool_system_prompt())
 
     # Add current date for context
     parts.append(f"\nCurrent date: {datetime.datetime.now().strftime('%Y-%m-%d %A')}")
@@ -574,8 +719,31 @@ def build_prompt(user_message: str, tool_results: dict[str, str], conversation: 
 # Ollama call
 # ---------------------------------------------------------------------------
 
-def call_ollama(messages: list[dict], model: str, stream: bool = False) -> str | Response:
-    """Call Ollama's chat API. Non-streaming retries up to 2 times on 503/connection errors."""
+def _is_cloud_model(model: str) -> bool:
+    """Return True if this model should be routed to Ollama cloud.
+    Any model with a ':cloud' suffix is considered a cloud model.
+    """
+    return model.endswith(":cloud")
+
+
+def _ollama_headers(cloud: bool = False) -> dict:
+    """Build headers for Ollama requests. Adds Authorization for cloud."""
+    headers = {"Content-Type": "application/json"}
+    if cloud and OLLAMA_API_KEY:
+        headers["Authorization"] = f"Bearer {OLLAMA_API_KEY}"
+    return headers
+
+
+def call_ollama(messages: list[dict], model: str, stream: bool = False) -> "str | Response":
+    """Call Ollama's chat API (local or cloud).
+    Routes :cloud models to OLLAMA_CLOUD_URL with Authorization header.
+    Non-streaming retries up to 2 times on 503/connection errors.
+    """
+    cloud = _is_cloud_model(model)
+    base_url = OLLAMA_CLOUD_URL if cloud else OLLAMA_URL
+    session = _cloud_session if cloud else _ollama_session
+    headers = _ollama_headers(cloud)
+
     payload = {
         "model": model,
         "messages": messages,
@@ -589,9 +757,10 @@ def call_ollama(messages: list[dict], model: str, stream: bool = False) -> str |
     if stream:
         def generate():
             try:
-                r = requests.post(
-                    f"{OLLAMA_URL}/api/chat",
+                r = session.post(
+                    f"{base_url}/api/chat",
                     json=payload,
+                    headers=headers,
                     stream=True,
                     timeout=OLLAMA_TIMEOUT,
                 )
@@ -616,17 +785,22 @@ def call_ollama(messages: list[dict], model: str, stream: bool = False) -> str |
         last_err = None
         for attempt in range(3):
             try:
-                r = requests.post(
-                    f"{OLLAMA_URL}/api/chat",
+                r = session.post(
+                    f"{base_url}/api/chat",
                     json=payload,
+                    headers=headers,
                     timeout=OLLAMA_TIMEOUT,
                 )
                 if r.status_code == 503 and attempt < 2:
                     time.sleep(1)
-                    last_err = f"Ollama returned 503"
+                    last_err = "Ollama returned 503"
                     continue
+                if r.status_code == 401:
+                    raise PermissionError(f"Ollama auth failed (cloud={cloud}). Check OLLAMA_API_KEY.")
                 data = r.json()
                 return data.get("message", {}).get("content", "No response from model")
+            except (PermissionError, TimeoutError):
+                raise
             except requests.exceptions.Timeout:
                 raise TimeoutError("Ollama request timed out after 120 seconds")
             except requests.exceptions.ConnectionError as e:
@@ -637,6 +811,197 @@ def call_ollama(messages: list[dict], model: str, stream: bool = False) -> str |
             except Exception as e:
                 return f"Ollama error: {e}"
         raise TimeoutError(f"Ollama unreachable after 3 attempts: {last_err}")
+
+
+# ---------------------------------------------------------------------------
+# Groq — fast cloud reasoning
+# ---------------------------------------------------------------------------
+
+def call_groq(messages: list[dict], stream: bool = False) -> "str | Response":
+    """Call Groq API (OpenAI-compatible). Falls back to local deepseek on failure."""
+    if not GROQ_API_KEY:
+        return call_ollama(messages, DEFAULT_MODEL, stream=stream)
+
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+    }
+    payload = {
+        "model": GROQ_MODEL,
+        "messages": messages,
+        "stream": stream,
+        "max_tokens": 4096,
+        "temperature": 0.6,
+    }
+
+    if stream:
+        def generate():
+            try:
+                r = requests.post(GROQ_URL, json=payload, headers=headers,
+                                  stream=True, timeout=30)
+                for line in r.iter_lines():
+                    if not line:
+                        continue
+                    raw = line.decode() if isinstance(line, bytes) else line
+                    if raw.startswith("data: "):
+                        raw = raw[6:]
+                    if raw.strip() == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(raw)
+                        token = chunk["choices"][0]["delta"].get("content", "")
+                        if token:
+                            yield json.dumps({"message": {"content": token}}) + "\n"
+                    except Exception:
+                        continue
+            except Exception as e:
+                yield json.dumps({"message": {"content": f"[Groq error: {e}]"}}) + "\n"
+        return Response(generate(), mimetype="application/x-ndjson")
+
+    try:
+        r = requests.post(GROQ_URL, json=payload, headers=headers, timeout=60)
+        r.raise_for_status()
+        return r.json()["choices"][0]["message"]["content"]
+    except Exception as e:
+        # Fall back to local model on Groq failure
+        return call_ollama(messages, DEFAULT_MODEL, stream=False)
+
+
+# ---------------------------------------------------------------------------
+# Cerebras — primary cloud reasoning (235B MoE)
+# ---------------------------------------------------------------------------
+
+def call_cerebras(messages: list[dict], large: bool = True, stream: bool = False) -> "str | Response":
+    """Call Cerebras API. Falls back to Groq, then local deepseek on failure."""
+    if not CEREBRAS_API_KEY:
+        return call_groq(messages, stream=stream)
+
+    model = CEREBRAS_MODEL_LARGE if large else CEREBRAS_MODEL_FAST
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {CEREBRAS_API_KEY}",
+    }
+    payload = {
+        "model": model,
+        "messages": messages,
+        "stream": stream,
+        "max_completion_tokens": 4096,
+        "temperature": 0.6,
+    }
+
+    if stream:
+        def generate():
+            try:
+                r = requests.post(CEREBRAS_URL, json=payload, headers=headers,
+                                  stream=True, timeout=30)
+                for line in r.iter_lines():
+                    if not line:
+                        continue
+                    raw = line.decode() if isinstance(line, bytes) else line
+                    if raw.startswith("data: "):
+                        raw = raw[6:]
+                    if raw.strip() == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(raw)
+                        token = chunk["choices"][0]["delta"].get("content", "")
+                        if token:
+                            yield json.dumps({"message": {"content": token}}) + "\n"
+                    except Exception:
+                        continue
+            except Exception:
+                # Fall back to Groq on Cerebras failure
+                yield from _groq_stream_fallback(messages)
+        return Response(generate(), mimetype="application/x-ndjson")
+
+    try:
+        r = requests.post(CEREBRAS_URL, json=payload, headers=headers, timeout=60)
+        r.raise_for_status()
+        return r.json()["choices"][0]["message"]["content"]
+    except Exception:
+        return call_groq(messages, stream=False)
+
+
+def _groq_stream_fallback(messages):
+    """Used internally when Cerebras streaming fails mid-stream."""
+    try:
+        result = call_groq(messages, stream=False)
+        yield json.dumps({"message": {"content": result}}) + "\n"
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# vllm / InternVL2-26B vision call
+# ---------------------------------------------------------------------------
+
+def call_vllm_vision(messages: list[dict], stream: bool = False) -> "str | Response":
+    """Call the vllm OpenAI-compatible endpoint with InternVL2-26B."""
+    payload = {
+        "model": VLLM_VISION_MODEL,
+        "messages": messages,
+        "stream": stream,
+        "max_tokens": 1024,
+        "temperature": 0.7,
+    }
+
+    if stream:
+        def generate():
+            try:
+                r = _vllm_session.post(
+                    f"{VLLM_VISION_URL}/chat/completions",
+                    json=payload,
+                    stream=True,
+                    timeout=OLLAMA_TIMEOUT,
+                )
+                for line in r.iter_lines():
+                    if not line:
+                        continue
+                    text = line.decode("utf-8") if isinstance(line, bytes) else line
+                    if text.startswith("data: "):
+                        text = text[6:]
+                    if text.strip() == "[DONE]":
+                        yield f"data: {json.dumps({'content': '', 'done': True})}\n\n"
+                        break
+                    try:
+                        chunk = json.loads(text)
+                        token = chunk.get("choices", [{}])[0].get("delta", {}).get("content", "")
+                        if token:
+                            yield f"data: {json.dumps({'content': token})}\n\n"
+                    except Exception:
+                        pass
+            except requests.exceptions.Timeout:
+                yield f"data: {json.dumps({'error': 'vllm request timed out'})}\n\n"
+            except Exception as e:
+                yield f"data: {json.dumps({'error': str(e)})}\n\n"
+
+        return Response(stream_with_context(generate()), mimetype="text/event-stream")
+    else:
+        try:
+            r = _vllm_session.post(
+                f"{VLLM_VISION_URL}/chat/completions",
+                json=payload,
+                timeout=OLLAMA_TIMEOUT,
+            )
+            if r.status_code != 200:
+                raise RuntimeError(f"vllm returned HTTP {r.status_code}: {r.text[:200]}")
+            data = r.json()
+            return data["choices"][0]["message"]["content"]
+        except (RuntimeError, KeyError) as e:
+            raise RuntimeError(f"vllm error: {e}") from e
+        except requests.exceptions.Timeout:
+            raise TimeoutError("vllm request timed out")
+
+
+def _messages_have_image(messages: list[dict]) -> bool:
+    """Return True if any message contains an image_url content part."""
+    for msg in messages:
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "image_url":
+                    return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -655,6 +1020,73 @@ def scanner_page():
     return html
 
 
+@app.route("/v1/profile", methods=["GET"])
+@require_auth
+def get_profile_endpoint():
+    """GET /v1/profile — return user profile stats and memories."""
+    if not _PROFILE_AVAILABLE:
+        return jsonify({"error": "Profile module not available"}), 503
+    profile = get_profile()
+    return jsonify({
+        "stats": profile.get_stats(),
+        "memories": profile.all_memories(),
+        "top_topics": profile.get_top_topics(10),
+        "system_context": profile.system_context("smart-ollama"),
+    })
+
+
+@app.route("/v1/profile/remember", methods=["POST"])
+@require_auth
+def profile_remember():
+    """POST /v1/profile/remember — store a memory. Body: {key, value, category}"""
+    if not _PROFILE_AVAILABLE:
+        return jsonify({"error": "Profile module not available"}), 503
+    data = request.get_json(force=True) or {}
+    key = data.get("key", "").strip()
+    value = data.get("value", "").strip()
+    category = data.get("category", "fact")
+    if not key or not value:
+        return jsonify({"error": "key and value required"}), 400
+    get_profile().set_memory(key, value, category)
+    return jsonify({"status": "saved", "key": key, "value": value})
+
+
+@app.route("/v1/profile/correction", methods=["POST"])
+@require_auth
+def profile_correction():
+    """POST /v1/profile/correction — record a model correction."""
+    if not _PROFILE_AVAILABLE:
+        return jsonify({"error": "Profile module not available"}), 503
+    data = request.get_json(force=True) or {}
+    get_profile().record_correction(
+        original=data.get("original", ""),
+        corrected=data.get("corrected", ""),
+        service=data.get("service", "smart-ollama"),
+        context=data.get("context", ""),
+    )
+    return jsonify({"status": "recorded"})
+
+
+@app.route("/v1/tools", methods=["GET"])
+@require_auth
+def list_tools():
+    """GET /v1/tools — list available MCP-compatible tools."""
+    return jsonify({"tools": TOOLS, "count": len(TOOLS)})
+
+
+@app.route("/v1/tools/call", methods=["POST"])
+@require_auth
+def call_tool():
+    """POST /v1/tools/call — execute a tool directly. Body: {name, args}"""
+    data = request.get_json(force=True) or {}
+    name = data.get("name", "")
+    args = data.get("args", {})
+    if not name:
+        return jsonify({"error": "name required"}), 400
+    result = execute_tool(name, args)
+    return jsonify({"tool": name, "result": result})
+
+
 @app.route("/health")
 def health():
     """GET /health — no auth required."""
@@ -664,10 +1096,18 @@ def health():
     ollama_reachable = False
     model_names = []
     try:
-        r = requests.get(f"{OLLAMA_URL}/api/tags", timeout=3)
+        r = _ollama_session.get(f"{OLLAMA_URL}/api/tags", timeout=3)
         if r.status_code == 200:
             ollama_reachable = True
             model_names = [m["name"] for m in r.json().get("models", [])]
+    except Exception:
+        pass
+
+    # Check vllm reachability
+    vllm_reachable = False
+    try:
+        rv = _vllm_session.get(f"{VLLM_VISION_URL}/models", timeout=3)
+        vllm_reachable = rv.status_code == 200
     except Exception:
         pass
 
@@ -683,6 +1123,8 @@ def health():
         "uptime_seconds": uptime,
         "ollama_reachable": ollama_reachable,
         "model_names": model_names,
+        "vllm_reachable": vllm_reachable,
+        "vllm_vision_model": VLLM_VISION_MODEL,
         "db_size_bytes": db_size_bytes,
     })
 
@@ -696,11 +1138,16 @@ def index():
             "default": DEFAULT_MODEL,
             "fast": FAST_MODEL,
             "smart": SMART_MODEL,
+            "reasoning": f"cerebras:{CEREBRAS_MODEL_LARGE}" if CEREBRAS_API_KEY else (f"groq:{GROQ_MODEL}" if GROQ_API_KEY else DEFAULT_MODEL),
         },
-        "capabilities": ["web_search", "read_url", "calculate", "datetime", "weather", "tcg_grading"],
+        "capabilities": ["web_search", "read_url", "calculate", "datetime", "weather", "tcg_grading", "vision", "voice"],
         "endpoints": {
             "GET /health": "Health check (no auth required)",
-            "POST /v1/chat": "Chat with the AI (supports web search, URL reading, math, etc.)",
+            "POST /v1/chat": "Chat with the AI (supports web search, URL reading, math, etc.) — auto-routes fast/reasoning/vision",
+            "POST /v1/vision": "Vision chat routed to InternVL2-26B via vllm (OpenAI-compatible multipart)",
+            "POST /v1/voice/transcribe": "Speech-to-text (multipart audio field, uses Whisper)",
+            "POST /v1/voice/speak": "Text-to-speech — returns audio/mpeg (JSON: {text, lang})",
+            "POST /v1/voice/chat": "Full voice round-trip: audio in → AI response → audio out",
             "GET /v1/history": "Get last N chat messages from DB",
             "DELETE /v1/history": "Clear conversation history for your API key",
             "POST /v1/identify-card": "Identify any card — TCG or sports (fast: ~80ms, ?ai=true for AI)",
@@ -735,37 +1182,77 @@ def chat():
     if not user_message:
         return jsonify({"error": "Missing 'message' field"}), 400
 
-    # Model selection
-    model_choice = data.get("model", "default")
-    if model_choice == "fast":
-        model = FAST_MODEL
-    elif model_choice == "smart":
-        model = SMART_MODEL
-    elif model_choice == "default":
-        model = DEFAULT_MODEL
-    else:
-        model = model_choice  # Allow raw model names
-
-    # Model whitelist validation — reject unknown raw model names
-    if model_choice not in ("fast", "smart", "default"):
-        available = _get_available_models()
-        if available and model not in available:
-            return jsonify({
-                "error": f"Model '{model}' is not available. Available: {sorted(available)}",
-            }), 400
-
     conversation = data.get("conversation", [])
     stream = data.get("stream", False)
     use_tools = data.get("tools", True)
 
     t0 = time.time()
 
-    # Fast route: short messages with no tool keywords bypass tool detection
+    # --- Smart chat routing ---
+    # Patterns that suggest complex reasoning / analysis
+    _REASONING_KEYWORDS = re.compile(
+        r"\b(reason|explain|analyze|analyse|compare|why|how does|step.by.step|think|"
+        r"logic|proof|evaluate|debate|argue|pros and cons|summarize|summarise|"
+        r"write.*essay|write.*code|debug|implement|algorithm|hypothesis|research)\b",
+        re.IGNORECASE,
+    )
     _TOOL_KEYWORDS = re.compile(
         r"\b(search|look up|find|google|weather|calculate|compute|what is|who is|"
         r"url|http|https|news|latest|price|today|time|date)\b",
         re.IGNORECASE,
     )
+    # Check if any message in the conversation contains an image
+    has_image = _messages_have_image(conversation)
+
+    model_choice = data.get("model", "auto")
+
+    is_premium = getattr(g, "user_tier", "free") == "premium"
+
+    if model_choice == "fast":
+        model = FAST_MODEL
+    elif model_choice == "smart":
+        if is_premium and CEREBRAS_API_KEY:
+            model = "__cerebras__"
+        elif is_premium and GROQ_API_KEY:
+            model = "__groq__"
+        else:
+            model = SMART_MODEL if OLLAMA_API_KEY else DEFAULT_MODEL
+    elif model_choice in ("default", "auto"):
+        if has_image:
+            model = "__vllm__"
+        elif _REASONING_KEYWORDS.search(user_message) or len(user_message) > 200:
+            if is_premium and CEREBRAS_API_KEY:
+                model = "__cerebras__"
+            elif is_premium and GROQ_API_KEY:
+                model = "__groq__"
+            else:
+                model = DEFAULT_MODEL  # free tier: local deepseek
+        elif len(user_message) < 80 and not _TOOL_KEYWORDS.search(user_message):
+            model = FAST_MODEL
+        else:
+            model = FAST_MODEL
+    else:
+        # Raw model name requested — block premium models for free tier
+        _PREMIUM_MODELS = {"__cerebras__", "__groq__", CEREBRAS_MODEL_LARGE, CEREBRAS_MODEL_FAST, GROQ_MODEL}
+        if model_choice in _PREMIUM_MODELS and not is_premium:
+            return jsonify({"error": "This model requires a premium subscription."}), 403
+        model = model_choice
+
+    # Vision models must never be used for text-only chat
+    _VISION_ONLY_MODELS = {"moondream:latest", "moondream", "qwen2.5vl:7b", "qwen2.5vl:3b"}
+    if model in _VISION_ONLY_MODELS and not has_image:
+        model = FAST_MODEL
+
+    # Model whitelist validation — reject unknown raw model names (skip cloud + vllm pseudo-model)
+    if model_choice not in ("fast", "smart", "default", "auto") and model != "__vllm__":
+        if not _is_cloud_model(model):
+            available = _get_available_models()
+            if available and model not in available:
+                return jsonify({
+                    "error": f"Model '{model}' is not available. Available: {sorted(available)}",
+                }), 400
+
+    # Fast route: short messages with no tool keywords bypass tool detection
     fast_route = (
         use_tools
         and len(user_message) < 50
@@ -781,7 +1268,7 @@ def chat():
             tools_used = [t[0] for t in tools_to_run]
             tool_results = run_tools(tools_to_run)
 
-    # Non-streaming: check response cache before calling Ollama
+    # Non-streaming: check response cache before calling model
     if not stream:
         cache_key = _response_cache_key(model, user_message, tools_used)
         cached = _get_response_cache(cache_key)
@@ -792,15 +1279,57 @@ def chat():
     # Build prompt with tool context
     messages = build_prompt(user_message, tool_results, conversation)
 
-    # Call Ollama
-    if stream:
-        return call_ollama(messages, model, stream=True)
+    # Route to Cerebras (primary) or Groq (fallback) for reasoning
+    if model == "__cerebras__":
+        return call_cerebras(messages, large=True, stream=stream)
+    if model == "__groq__":
+        return call_groq(messages, stream=stream)
 
-    try:
-        response_text = call_ollama(messages, model, stream=False)
-    except TimeoutError as e:
-        return jsonify({"error": str(e)}), 504
-    elapsed = time.time() - t0
+    # Route to vllm for vision — fall back to qwen2.5vl:7b locally if vllm down
+    if model == "__vllm__":
+        if stream:
+            # Try vllm first; fall back to local qwen2.5vl
+            try:
+                return call_vllm_vision(messages, stream=True)
+            except Exception:
+                return call_ollama(messages, VISION_LOCAL_MODEL, stream=True)
+        try:
+            response_text = call_vllm_vision(messages, stream=False)
+            model = VLLM_VISION_MODEL  # label the actual model used in response
+        except (TimeoutError, RuntimeError):
+            # vllm unavailable — use qwen2.5vl:7b locally
+            response_text = call_ollama(messages, VISION_LOCAL_MODEL, stream=False)
+            model = VISION_LOCAL_MODEL
+        except Exception as e:
+            return jsonify({"error": str(e)}), 504
+        elapsed = time.time() - t0
+    # Otherwise call Ollama (local or cloud)
+    elif stream:
+        return call_ollama(messages, model, stream=True)
+    else:
+        try:
+            response_text = call_ollama(messages, model, stream=False)
+        except TimeoutError as e:
+            return jsonify({"error": str(e)}), 504
+        except PermissionError as e:
+            return jsonify({"error": str(e)}), 403
+        elapsed = time.time() - t0
+
+    # Record interaction for personalization
+    if _PROFILE_AVAILABLE:
+        try:
+            profile = get_profile()
+            if profile:
+                # Infer topics from message
+                topics = _infer_topics(user_message)
+                profile.record_interaction(
+                    user_message,
+                    service="smart-ollama",
+                    model=model,
+                    topics=topics,
+                )
+        except Exception:
+            pass
 
     # Log
     db = get_db()
@@ -830,7 +1359,7 @@ def chat():
 @require_key
 def list_models():
     try:
-        r = requests.get(f"{OLLAMA_URL}/api/tags", timeout=5)
+        r = _ollama_session.get(f"{OLLAMA_URL}/api/tags", timeout=5)
         models = r.json().get("models", [])
         return jsonify({
             "models": [
@@ -845,9 +1374,94 @@ def list_models():
             "default": DEFAULT_MODEL,
             "fast": FAST_MODEL,
             "smart": SMART_MODEL,
+            "vision": VLLM_VISION_MODEL,
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+# ---------------------------------------------------------------------------
+# Vision endpoint — routes to InternVL2-26B via vllm
+# ---------------------------------------------------------------------------
+
+@app.route("/v1/vision", methods=["POST"])
+@require_key
+def vision_chat():
+    """
+    POST /v1/vision
+    OpenAI-compatible multimodal chat routed to InternVL2-26B via vllm.
+
+    Accepts:
+      application/json:
+        {
+          "messages": [{"role": "user", "content": [
+              {"type": "text", "text": "Describe this image"},
+              {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,..."}}
+          ]}],
+          "stream": false
+        }
+
+      OR shorthand:
+        {
+          "message": "Describe this image",
+          "image_base64": "<base64>",
+          "stream": false
+        }
+    """
+    data = request.get_json(force=True, silent=True) or {}
+
+    # Support shorthand format
+    if "messages" not in data:
+        user_text = data.get("message", "").strip()
+        b64 = data.get("image_base64", "")
+        if not user_text and not b64:
+            return jsonify({"error": "Provide 'messages' or 'message'+'image_base64'"}), 400
+
+        content: list = []
+        if user_text:
+            content.append({"type": "text", "text": user_text})
+        if b64:
+            # Accept raw base64 or data URL
+            if not b64.startswith("data:"):
+                b64 = f"data:image/jpeg;base64,{b64}"
+            content.append({"type": "image_url", "image_url": {"url": b64}})
+        messages = [{"role": "user", "content": content}]
+    else:
+        messages = data["messages"]
+
+    if not messages:
+        return jsonify({"error": "No messages provided"}), 400
+
+    stream = data.get("stream", False)
+    t0 = time.time()
+
+    if stream:
+        return call_vllm_vision(messages, stream=True)
+
+    try:
+        response_text = call_vllm_vision(messages, stream=False)
+    except TimeoutError as e:
+        return jsonify({"error": str(e)}), 504
+    except RuntimeError as e:
+        return jsonify({"error": str(e)}), 502
+
+    elapsed = time.time() - t0
+
+    # Log to DB
+    user_summary = str(messages[-1].get("content", ""))[:200]
+    db = get_db()
+    db.execute(
+        "INSERT INTO chat_log (api_key, model, user_message, assistant_message, tools_used, elapsed, created_at) VALUES (?,?,?,?,?,?,?)",
+        (g.api_key, VLLM_VISION_MODEL, user_summary, response_text[:500], "[]", elapsed, time.time()),
+    )
+    db.commit()
+    db.close()
+
+    return jsonify({
+        "response": response_text,
+        "model": VLLM_VISION_MODEL,
+        "elapsed_seconds": round(elapsed, 2),
+    })
 
 
 @app.route("/v1/usage", methods=["GET"])
@@ -861,6 +1475,7 @@ def usage():
     ).fetchall()
     db.close()
     return jsonify({
+        "tier": key_row["tier"] if "tier" in key_row.keys() else "free",
         "total_requests": key_row["requests_count"],
         "recent": [dict(r) for r in recent],
     })
@@ -906,10 +1521,36 @@ def create_key():
     name = data.get("name", "default")
     key = gen_key()
     db = get_db()
-    db.execute("INSERT INTO api_keys (key, name, created_at) VALUES (?,?,?)", (key, name, time.time()))
+    tier = data.get("tier", "free")
+    if tier not in ("free", "premium"):
+        tier = "free"
+    db.execute("INSERT INTO api_keys (key, name, created_at, tier) VALUES (?,?,?,?)", (key, name, time.time(), tier))
     db.commit()
     db.close()
-    return jsonify({"api_key": key, "name": name}), 201
+    return jsonify({"api_key": key, "name": name, "tier": tier}), 201
+
+
+@app.route("/v1/keys/<key>/tier", methods=["PATCH"])
+def set_key_tier(key: str):
+    """PATCH /v1/keys/<key>/tier — upgrade or downgrade a key's tier.
+    Body: {"tier": "premium"} or {"tier": "free"}
+    Requires admin secret in Authorization header.
+    """
+    admin_secret = os.environ.get("ADMIN_SECRET", "")
+    auth = request.headers.get("Authorization", "")
+    if not admin_secret or auth != f"Bearer {admin_secret}":
+        return jsonify({"error": "Unauthorized"}), 401
+    data = request.get_json(force=True, silent=True) or {}
+    tier = data.get("tier", "")
+    if tier not in ("free", "premium"):
+        return jsonify({"error": "tier must be 'free' or 'premium'"}), 400
+    db = get_db()
+    result = db.execute("UPDATE api_keys SET tier=? WHERE key=?", (tier, key))
+    db.commit()
+    db.close()
+    if result.rowcount == 0:
+        return jsonify({"error": "Key not found"}), 404
+    return jsonify({"key": key[:20] + "...", "tier": tier})
 
 
 # ---------------------------------------------------------------------------
@@ -980,7 +1621,7 @@ Provide your grading assessment as JSON."""
 
     ai_result = {}
     try:
-        r = requests.post(f"{OLLAMA_URL}/api/chat", json={
+        r = _ollama_session.post(f"{OLLAMA_URL}/api/chat", json={
             "model": "tcg-grader",
             "messages": [{"role": "user", "content": ai_prompt}],
             "stream": False,
@@ -1068,26 +1709,39 @@ def _is_card_image(img_data):
     except Exception:
         pass
 
-    # Ambiguous or Pillow unavailable — ask llava for a quick yes/no
+    # Ambiguous or Pillow unavailable — try InternVL2 via vllm first, fall back to local llava
+    b64 = base64.b64encode(img_data).decode()
+    card_prompt = "Is this image a trading card, sports card, or collectible card? Answer with only YES or NO."
+
+    # Try InternVL2 via vllm
     try:
-        b64 = base64.b64encode(img_data).decode()
-        r = requests.post(
-            f"{OLLAMA_URL}/api/generate",
-            json={
-                "model": "llava",
-                "prompt": "Is this image a trading card, sports card, or collectible card? Answer with only YES or NO.",
-                "images": [b64],
-                "stream": False,
-                "options": {"temperature": 0.0, "num_predict": 10, "num_ctx": 512},
-            },
-            timeout=15,
-        )
-        if r.status_code == 200:
-            text = r.json().get("response", "").strip().upper()
-            if text.startswith("NO"):
-                return False, "This does not appear to be a trading card."
+        vllm_messages = [{"role": "user", "content": [
+            {"type": "text", "text": card_prompt},
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+        ]}]
+        text = call_vllm_vision(vllm_messages, stream=False)
+        if isinstance(text, str) and text.strip().upper().startswith("NO"):
+            return False, "This does not appear to be a trading card."
     except Exception:
-        pass
+        # Fall back to local vision model
+        try:
+            r = _ollama_session.post(
+                f"{OLLAMA_URL}/api/generate",
+                json={
+                    "model": VISION_LOCAL_MODEL,
+                    "prompt": card_prompt,
+                    "images": [b64],
+                    "stream": False,
+                    "options": {"temperature": 0.0, "num_predict": 10, "num_ctx": 512},
+                },
+                timeout=15,
+            )
+            if r.status_code == 200:
+                text = r.json().get("response", "").strip().upper()
+                if text.startswith("NO"):
+                    return False, "This does not appear to be a trading card."
+        except Exception:
+            pass
 
     # Fail open — allow grading if we can't determine
     return True, "card check skipped"
@@ -1245,9 +1899,174 @@ def identify_card_route():
 
 
 # ---------------------------------------------------------------------------
+# Voice mode — POST /v1/voice/transcribe  &  POST /v1/voice/speak
+# ---------------------------------------------------------------------------
+import io as _io
+import subprocess as _subp
+import tempfile as _tmpf
+
+@app.route("/v1/voice/transcribe", methods=["POST"])
+@require_key
+def voice_transcribe():
+    """Accept audio file (wav/mp3/ogg/webm), return text transcript using Whisper.
+    Multipart: field 'audio' with the file.
+    Requires whisper: pip3 install openai-whisper
+    """
+    if "audio" not in request.files:
+        return jsonify({"error": "audio file required (multipart field 'audio')"}), 400
+    audio_file = request.files["audio"]
+    model_size  = request.form.get("model", "base")  # tiny/base/small
+
+    try:
+        import whisper as _whisper
+    except ImportError:
+        return jsonify({"error": "whisper not installed: pip3 install openai-whisper"}), 503
+
+    with _tmpf.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+        audio_file.save(tmp.name)
+        try:
+            model = _whisper.load_model(model_size)
+            result = model.transcribe(tmp.name)
+            return jsonify({"text": result["text"].strip(), "language": result.get("language", "en")})
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+        finally:
+            import os as _os; _os.unlink(tmp.name)
+
+@app.route("/v1/voice/speak", methods=["POST"])
+@require_key
+def voice_speak():
+    """Convert text to speech. Returns audio/mpeg binary.
+    Body JSON: {"text": "...", "lang": "en"}
+    Uses gTTS (Google TTS, requires internet) — fast, natural quality.
+    """
+    data = request.get_json(silent=True) or {}
+    text = (data.get("text") or "").strip()
+    lang = data.get("lang", "en")
+    if not text:
+        return jsonify({"error": "text required"}), 400
+    try:
+        from gtts import gTTS as _gTTS
+        from flask import Response as _Resp
+        buf = _io.BytesIO()
+        tts = _gTTS(text=text, lang=lang)
+        tts.write_to_fp(buf)
+        buf.seek(0)
+        return _Resp(buf.read(), mimetype="audio/mpeg",
+                     headers={"Content-Disposition": "attachment; filename=speech.mp3"})
+    except ImportError:
+        return jsonify({"error": "gTTS not installed: pip3 install gtts"}), 503
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/v1/voice/chat", methods=["POST"])
+@require_key
+def voice_chat():
+    """Full voice round-trip: audio in → text → AI response → audio out.
+    Multipart: field 'audio' + optional 'lang' form field.
+    Returns JSON with transcript, ai_response, and audio_url for playback.
+    """
+    if "audio" not in request.files:
+        return jsonify({"error": "audio field required"}), 400
+
+    # Step 1: transcribe
+    audio_file = request.files["audio"]
+    lang        = request.form.get("lang", "en")
+    model_size  = request.form.get("whisper_model", "base")
+
+    try:
+        import whisper as _whisper
+    except ImportError:
+        return jsonify({"error": "whisper not installed"}), 503
+
+    with _tmpf.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+        audio_file.save(tmp.name)
+        try:
+            w_model  = _whisper.load_model(model_size)
+            w_result = w_model.transcribe(tmp.name)
+            transcript = w_result["text"].strip()
+        finally:
+            import os as _os; _os.unlink(tmp.name)
+
+    if not transcript:
+        return jsonify({"error": "Could not transcribe audio"}), 400
+
+    # Step 2: get AI response (reuse chat logic)
+    key_row = g.get("api_key_row") or {}
+    tier    = key_row.get("tier", "free") if key_row else "free"
+
+    model   = DEFAULT_MODEL
+    if tier == "premium" and CEREBRAS_API_KEY:
+        ai_text = _call_cerebras_stream_collect(transcript)
+    elif GROQ_API_KEY:
+        ai_text = _call_groq_collect(transcript)
+    else:
+        ai_text = _ollama_generate_collect(transcript, model)
+
+    # Step 3: TTS the response
+    try:
+        from gtts import gTTS as _gTTS
+        import base64 as _b64
+        buf = _io.BytesIO()
+        _gTTS(text=ai_text, lang=lang).write_to_fp(buf)
+        audio_b64 = _b64.b64encode(buf.getvalue()).decode()
+    except Exception:
+        audio_b64 = None
+
+    return jsonify({
+        "transcript": transcript,
+        "ai_response": ai_text,
+        "audio_base64": audio_b64,
+        "audio_mime": "audio/mpeg",
+    })
+
+
+def _call_cerebras_stream_collect(prompt: str) -> str:
+    """Non-streaming Cerebras call, returns full text."""
+    try:
+        import urllib.request as _ur, json as _j
+        payload = _j.dumps({"model": CEREBRAS_MODEL_LARGE,
+                             "messages": [{"role": "user", "content": prompt}],
+                             "max_tokens": 1024, "stream": False}).encode()
+        req = _ur.Request(CEREBRAS_URL, data=payload,
+                          headers={"Authorization": f"Bearer {CEREBRAS_API_KEY}",
+                                   "Content-Type": "application/json"}, method="POST")
+        with _ur.urlopen(req, timeout=30) as resp:
+            return _j.loads(resp.read())["choices"][0]["message"]["content"]
+    except Exception:
+        return _ollama_generate_collect(prompt, DEFAULT_MODEL)
+
+def _call_groq_collect(prompt: str) -> str:
+    try:
+        import urllib.request as _ur, json as _j
+        payload = _j.dumps({"model": GROQ_MODEL,
+                             "messages": [{"role": "user", "content": prompt}],
+                             "max_tokens": 1024}).encode()
+        req = _ur.Request(GROQ_URL, data=payload,
+                          headers={"Authorization": f"Bearer {GROQ_API_KEY}",
+                                   "Content-Type": "application/json"}, method="POST")
+        with _ur.urlopen(req, timeout=30) as resp:
+            return _j.loads(resp.read())["choices"][0]["message"]["content"]
+    except Exception:
+        return _ollama_generate_collect(prompt, DEFAULT_MODEL)
+
+def _ollama_generate_collect(prompt: str, model: str) -> str:
+    try:
+        import urllib.request as _ur, json as _j
+        payload = _j.dumps({"model": model, "prompt": prompt, "stream": False}).encode()
+        req = _ur.Request(f"{OLLAMA_URL}/api/generate", data=payload,
+                          headers={"Content-Type": "application/json"}, method="POST")
+        with _ur.urlopen(req, timeout=60) as resp:
+            return _j.loads(resp.read()).get("response", "")
+    except Exception as e:
+        return f"Error: {e}"
+
+
+# ---------------------------------------------------------------------------
 # Boot
 # ---------------------------------------------------------------------------
 
+attach_stats_middleware(app, 'smart-ollama')
 if __name__ == "__main__":
     init_db()
     init_training_tables()
@@ -1269,11 +2088,22 @@ if __name__ == "__main__":
 
     # Verify Ollama
     try:
-        r = requests.get(f"{OLLAMA_URL}/api/tags", timeout=3)
+        r = _ollama_session.get(f"{OLLAMA_URL}/api/tags", timeout=3)
         models = [m["name"] for m in r.json().get("models", [])]
         print(f"  Ollama OK — models: {', '.join(models)}")
     except Exception:
         print(f"  WARNING: Ollama not reachable at {OLLAMA_URL}")
+
+    # Verify vllm
+    try:
+        rv = _vllm_session.get(f"{VLLM_VISION_URL}/models", timeout=3)
+        if rv.status_code == 200:
+            vllm_models = [m["id"] for m in rv.json().get("data", [])]
+            print(f"  vllm OK — vision model: {', '.join(vllm_models) or VLLM_VISION_MODEL}")
+        else:
+            print(f"  WARNING: vllm returned HTTP {rv.status_code} at {VLLM_VISION_URL}")
+    except Exception:
+        print(f"  WARNING: vllm not reachable at {VLLM_VISION_URL} (vision endpoint will be unavailable)")
 
     # Create TCG grader Ollama model
     print("  Creating TCG grader model...")
@@ -1288,8 +2118,9 @@ if __name__ == "__main__":
     start_trainer()
 
     print(f"  Default model: {DEFAULT_MODEL}")
-    print(f"  Smart model:   {SMART_MODEL}")
+    print(f"  Smart model:   {SMART_MODEL} {'(cloud)' if _is_cloud_model(SMART_MODEL) else '(local)'}")
     print(f"  Fast model:    {FAST_MODEL}")
+    print(f"  Vision model:  {VLLM_VISION_MODEL} via {VLLM_VISION_URL}")
     print(f"  TCG model:     tcg-grader")
     port = int(os.environ.get("PORT", 9000))
     print(f"\n  Smart Ollama API running on http://localhost:{port}\n")
