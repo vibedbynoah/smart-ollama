@@ -11,26 +11,19 @@ _sys.path.insert(0, _os.path.expanduser('~'))
 from load_env import load_dev_vars as _lenv; _lenv()
 del _sys, _os, _lenv
 
-import ast
-import json
-import re
-import os
-import math
+import datetime
 import hashlib
+import json
+import os
+import re
 import secrets
 import sqlite3
 import time
-import datetime
 import traceback
-from concurrent.futures import ThreadPoolExecutor
-from functools import wraps
-from urllib.parse import quote_plus
-
 import base64
+from functools import wraps
+
 import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-from bs4 import BeautifulSoup
 from flask import Flask, request, jsonify, Response, stream_with_context, g
 
 # Shared personalization + tool registry
@@ -45,6 +38,17 @@ except ImportError:
     def execute_tool(n, a): return ""
     def run_with_tools(msgs, model, **kw): return "", msgs
     def build_tool_system_prompt(s=""): return s
+
+from tools import detect_tools, run_tools, build_prompt, _PROFILE_AVAILABLE as _TOOLS_PROFILE_AVAILABLE
+from model_backends import (
+    call_ollama, call_groq, call_cerebras, call_vllm_vision,
+    _is_cloud_model, _messages_have_image,
+    collect_cerebras, collect_groq, collect_ollama,
+    DEFAULT_MODEL, FAST_MODEL, SMART_MODEL, VISION_LOCAL_MODEL,
+    OLLAMA_URL, VLLM_VISION_URL, VLLM_VISION_MODEL,
+    GROQ_API_KEY, GROQ_MODEL, CEREBRAS_API_KEY, CEREBRAS_MODEL_LARGE,
+    _ollama_session, _vllm_session,
+)
 
 from tcg.cv_grader import grade_card_image
 from tcg.card_identifier import identify_card, CardIdentity, search_ebay_listings, get_beckett_prices
@@ -81,67 +85,16 @@ def _infer_topics(text: str) -> list[str]:
         topic for topic, pattern in _TOPIC_PATTERNS.items()
         if _re.search(pattern, text_lower)
     ]
-OLLAMA_TIMEOUT = 120  # seconds
-
-OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
+OLLAMA_TIMEOUT = int(os.environ.get("OLLAMA_TIMEOUT", "60"))
 OLLAMA_CLOUD_URL = os.environ.get("OLLAMA_CLOUD_URL", "https://ollama.com/api")
-OLLAMA_API_KEY = os.environ.get("OLLAMA_API_KEY", "")
-VLLM_VISION_URL = os.environ.get("VLLM_VISION_URL", "http://localhost:8000/v1")
-VLLM_VISION_MODEL = os.environ.get("VLLM_VISION_MODEL", "OpenGVLab/InternVL2-26B")
-
-# Model defaults
-DEFAULT_MODEL = os.environ.get("OLLAMA_MODEL", "deepseek-r1:7b")
-FAST_MODEL = os.environ.get("OLLAMA_FAST_MODEL", "qwen3:1.7b")
-SMART_MODEL = os.environ.get("OLLAMA_SMART_MODEL", "minimax-m2.5:cloud")
-VISION_LOCAL_MODEL = os.environ.get("OLLAMA_VISION_MODEL", "qwen2.5vl:7b")
-
-# Groq — fast cloud reasoning fallback
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
-GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-
-# Cerebras — primary cloud reasoning (235B MoE, extremely fast + capable)
-CEREBRAS_API_KEY = os.environ.get("CEREBRAS_API_KEY", "")
-CEREBRAS_MODEL_LARGE = os.environ.get("CEREBRAS_MODEL_LARGE", "qwen-3-235b-a22b-instruct-2507")
+OLLAMA_API_KEY   = os.environ.get("OLLAMA_API_KEY", "")
 CEREBRAS_MODEL_FAST = os.environ.get("CEREBRAS_MODEL_FAST", "llama3.1-8b")
 CEREBRAS_URL = "https://api.cerebras.ai/v1/chat/completions"
+GROQ_URL     = "https://api.groq.com/openai/v1/chat/completions"
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "smart_ollama.db")
 
-SEARCH_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    "Accept": "text/html",
-    "Accept-Language": "en-US,en;q=0.9",
-}
-
-# ---------------------------------------------------------------------------
-# Connection pooling — one session per backend
-# ---------------------------------------------------------------------------
-
-def _make_session(retries: int = 2, backoff: float = 0.5) -> requests.Session:
-    """Create a requests.Session with retry logic and connection pooling."""
-    session = requests.Session()
-    retry = Retry(
-        total=retries,
-        backoff_factor=backoff,
-        status_forcelist=[502, 503, 504],
-        allowed_methods=["GET", "POST"],
-        raise_on_status=False,
-    )
-    adapter = HTTPAdapter(
-        max_retries=retry,
-        pool_connections=4,
-        pool_maxsize=16,
-    )
-    session.mount("http://", adapter)
-    session.mount("https://", adapter)
-    return session
-
-# Shared sessions — reused across requests for connection pooling
-_ollama_session = _make_session()          # local Ollama
-_cloud_session = _make_session()           # Ollama cloud API
-_vllm_session = _make_session()            # vllm InternVL2
-_web_session = _make_session(retries=1)    # web scraping / weather
+# Sessions and search tools live in tools.py / model_backends.py
 
 
 # ---------------------------------------------------------------------------
@@ -210,7 +163,10 @@ def init_db():
             name TEXT NOT NULL,
             created_at REAL NOT NULL,
             requests_count INTEGER DEFAULT 0,
-            tier TEXT NOT NULL DEFAULT 'free'
+            tier TEXT NOT NULL DEFAULT 'free',
+            daily_requests INTEGER NOT NULL DEFAULT 0,
+            daily_limit INTEGER NOT NULL DEFAULT 50,
+            last_reset TEXT NOT NULL DEFAULT ''
         );
         CREATE TABLE IF NOT EXISTS chat_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -229,12 +185,18 @@ def init_db():
         );
     """)
     db.commit()
-    # Safe migration: add tier column to existing deployments
-    try:
-        db.execute("ALTER TABLE api_keys ADD COLUMN tier TEXT NOT NULL DEFAULT 'free'")
-        db.commit()
-    except Exception:
-        pass  # Column already exists
+    # Safe migrations for existing deployments
+    for col, sql in [
+        ("tier",           "ALTER TABLE api_keys ADD COLUMN tier TEXT NOT NULL DEFAULT 'free'"),
+        ("daily_requests", "ALTER TABLE api_keys ADD COLUMN daily_requests INTEGER NOT NULL DEFAULT 0"),
+        ("daily_limit",    "ALTER TABLE api_keys ADD COLUMN daily_limit INTEGER NOT NULL DEFAULT 50"),
+        ("last_reset",     "ALTER TABLE api_keys ADD COLUMN last_reset TEXT NOT NULL DEFAULT ''"),
+    ]:
+        try:
+            db.execute(sql)
+            db.commit()
+        except Exception:
+            pass
     db.close()
 
 
@@ -328,10 +290,41 @@ def require_key(f):
         if not row:
             db.close()
             return jsonify({"error": "Invalid API key"}), 401
-        db.execute("UPDATE api_keys SET requests_count = requests_count + 1 WHERE key=?", (key,))
+
+        row_dict = dict(row)
+        tier = row_dict.get("tier", "free")
+        daily_limit = row_dict.get("daily_limit", 50)
+        daily_requests = row_dict.get("daily_requests", 0)
+        last_reset = row_dict.get("last_reset", "")
+        today = datetime.datetime.utcnow().strftime("%Y-%m-%d")
+
+        # Reset counter at UTC midnight
+        if last_reset != today:
+            daily_requests = 0
+            db.execute(
+                "UPDATE api_keys SET daily_requests = 0, last_reset = ? WHERE key = ?",
+                (today, key),
+            )
+
+        # Enforce free-tier daily cap
+        if tier == "free" and daily_limit >= 0 and daily_requests >= daily_limit:
+            db.close()
+            tomorrow = (datetime.datetime.utcnow() + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+            return jsonify({
+                "error": f"Daily free-tier limit reached ({daily_limit} requests/day). Resets at {tomorrow}T00:00:00Z.",
+                "daily_requests": daily_requests,
+                "daily_limit": daily_limit,
+                "resets_at": f"{tomorrow}T00:00:00Z",
+                "upgrade": "Contact us to remove the daily limit.",
+            }), 429
+
+        db.execute(
+            "UPDATE api_keys SET requests_count = requests_count + 1, daily_requests = daily_requests + 1 WHERE key=?",
+            (key,),
+        )
         db.commit()
         g.api_key = key
-        g.user_tier = dict(row).get("tier", "free")
+        g.user_tier = tier
         db.close()
         return f(*args, **kwargs)
     return decorated
@@ -340,669 +333,7 @@ def require_key(f):
 require_auth = require_key
 
 
-# ---------------------------------------------------------------------------
-# Tools — the superpowers we give the model
-# ---------------------------------------------------------------------------
-
-def tool_web_search(query: str, num_results: int = 5) -> str:
-    """Search the web via DuckDuckGo with Google fallback."""
-    # --- Primary: DuckDuckGo HTML ---
-    ddg_result = _duckduckgo_search(query, num_results)
-    if ddg_result and not ddg_result.startswith("Search"):
-        return ddg_result
-    # --- Fallback: Google ---
-    google_result = tool_google_search(query, num_results)
-    if google_result and not google_result.startswith("Google search"):
-        return google_result
-    # --- Last resort: DuckDuckGo API (lite JSON endpoint) ---
-    return _duckduckgo_api_search(query, num_results)
-
-
-def _duckduckgo_search(query: str, num_results: int = 5) -> str:
-    """DuckDuckGo HTML scrape."""
-    try:
-        r = _web_session.get(
-            "https://html.duckduckgo.com/html/",
-            params={"q": query},
-            headers=SEARCH_HEADERS,
-            timeout=10,
-        )
-        if r.status_code != 200:
-            return f"Search failed (HTTP {r.status_code})"
-
-        soup = BeautifulSoup(r.text, "lxml")
-        results = []
-        for item in soup.select(".result")[:num_results]:
-            title_el = item.select_one(".result__title")
-            snippet_el = item.select_one(".result__snippet")
-            link_el = item.select_one("a.result__a")
-
-            title = title_el.get_text(strip=True) if title_el else ""
-            snippet = snippet_el.get_text(strip=True) if snippet_el else ""
-            url = link_el.get("href", "") if link_el else ""
-
-            if title and snippet:
-                entry = f"- {title}\n  {snippet}\n  {url}"
-                results.append(entry[:500])
-
-        return "\n\n".join(results) if results else ""
-    except Exception as e:
-        return f"Search error: {e}"
-
-
-def _duckduckgo_api_search(query: str, num_results: int = 5) -> str:
-    """DuckDuckGo Lite JSON API — no key needed, good fallback."""
-    try:
-        r = _web_session.get(
-            "https://api.duckduckgo.com/",
-            params={"q": query, "format": "json", "no_redirect": "1", "no_html": "1"},
-            headers=SEARCH_HEADERS,
-            timeout=10,
-        )
-        if r.status_code != 200:
-            return "No results found."
-        data = r.json()
-        results = []
-        # Abstract answer
-        abstract = data.get("AbstractText", "")
-        abstract_url = data.get("AbstractURL", "")
-        if abstract:
-            results.append(f"- {abstract}\n  {abstract_url}")
-        # Related topics
-        for topic in data.get("RelatedTopics", [])[:num_results]:
-            text = topic.get("Text", "")
-            url = topic.get("FirstURL", "")
-            if text:
-                results.append(f"- {text[:400]}\n  {url}")
-        return "\n\n".join(results) if results else "No results found."
-    except Exception as e:
-        return f"Search API error: {e}"
-
-
-def tool_google_search(query: str, num_results: int = 5) -> str:
-    """Fallback search via Google."""
-    try:
-        r = _web_session.get(
-            "https://www.google.com/search",
-            params={"q": query, "num": str(num_results)},
-            headers=SEARCH_HEADERS,
-            timeout=10,
-        )
-        if r.status_code != 200:
-            return f"Google search failed (HTTP {r.status_code})"
-
-        soup = BeautifulSoup(r.text, "lxml")
-        results = []
-        for div in soup.select("div.g, div[data-sokoban-container]")[:num_results]:
-            title_el = div.select_one("h3")
-            snippet_el = div.select_one("div[data-sncf], span.st, div.VwiC3b")
-            link_el = div.select_one("a")
-
-            title = title_el.get_text(strip=True) if title_el else ""
-            snippet = snippet_el.get_text(strip=True) if snippet_el else ""
-            url = link_el.get("href", "") if link_el else ""
-
-            if title and snippet:
-                entry = f"- {title}\n  {snippet}\n  {url}"
-                results.append(entry[:500])
-
-        return "\n\n".join(results) if results else ""
-    except Exception as e:
-        return f"Google search error: {e}"
-
-
-def tool_read_url(url: str) -> str:
-    """Fetch a URL and extract the main text content."""
-    try:
-        r = _web_session.get(url, headers=SEARCH_HEADERS, timeout=10)
-        if r.status_code != 200:
-            return f"Failed to fetch URL (HTTP {r.status_code})"
-
-        soup = BeautifulSoup(r.text, "lxml")
-
-        # Remove scripts, styles, nav, footer
-        for tag in soup.select("script, style, nav, footer, header, aside, .sidebar, .nav, .menu"):
-            tag.decompose()
-
-        # Try article or main content
-        main = soup.select_one("article, main, .content, .post, #content")
-        if main:
-            text = main.get_text("\n", strip=True)
-        else:
-            text = soup.get_text("\n", strip=True)
-
-        # Trim to reasonable size
-        lines = [l.strip() for l in text.split("\n") if l.strip()]
-        text = "\n".join(lines[:100])
-        if len(text) > 4000:
-            text = text[:4000] + "\n[...truncated]"
-
-        return text
-    except Exception as e:
-        return f"URL fetch error: {e}"
-
-
-_SAFE_MATH_NAMES = {
-    "abs", "round", "min", "max", "pow",
-    "sqrt", "log", "log10", "sin", "cos", "tan",
-    "ceil", "floor", "pi", "e",
-}
-
-_SAFE_MATH_VALS = {
-    "abs": abs, "round": round, "min": min, "max": max, "pow": pow,
-    "sqrt": math.sqrt, "log": math.log, "log10": math.log10,
-    "sin": math.sin, "cos": math.cos, "tan": math.tan,
-    "ceil": math.ceil, "floor": math.floor,
-    "pi": math.pi, "e": math.e,
-}
-
-
-class _SafeMathVisitor(ast.NodeVisitor):
-    """Raise ValueError on any node that isn't a safe math construct."""
-    _ALLOWED_NODES = (
-        ast.Expression, ast.BinOp, ast.UnaryOp, ast.Call,
-        ast.Constant, ast.Add, ast.Sub, ast.Mult, ast.Div,
-        ast.Pow, ast.Mod, ast.FloorDiv, ast.UAdd, ast.USub,
-        ast.Load,
-    )
-
-    def visit(self, node):
-        if not isinstance(node, self._ALLOWED_NODES):
-            if isinstance(node, ast.Name):
-                if node.id not in _SAFE_MATH_NAMES:
-                    raise ValueError(f"Name '{node.id}' is not allowed")
-            else:
-                raise ValueError(f"Unsafe node type: {type(node).__name__}")
-        return self.generic_visit(node)
-
-
-def tool_calculate(expression: str) -> str:
-    """Evaluate a math expression safely using AST parsing."""
-    try:
-        expression = expression.replace("^", "**").strip()
-        tree = ast.parse(expression, mode="eval")
-        _SafeMathVisitor().visit(tree)
-        result = eval(compile(tree, "<expr>", "eval"), {"__builtins__": {}}, _SAFE_MATH_VALS)
-        return str(result)
-    except ValueError as e:
-        return f"Calculation rejected: {e}"
-    except Exception as e:
-        return f"Calculation error: {e}"
-
-
-def tool_datetime() -> str:
-    """Get current date and time."""
-    now = datetime.datetime.now()
-    utc = datetime.datetime.utcnow()
-    return f"Local: {now.strftime('%Y-%m-%d %H:%M:%S %A')}\nUTC: {utc.strftime('%Y-%m-%d %H:%M:%S')}"
-
-
-def tool_weather(location: str) -> str:
-    """Get current weather for a location."""
-    try:
-        r = _web_session.get(f"https://wttr.in/{quote_plus(location)}?format=j1", timeout=10)
-        if r.status_code != 200:
-            return f"Weather fetch failed (HTTP {r.status_code})"
-        data = r.json()
-        current = data.get("current_condition", [{}])[0]
-        area = data.get("nearest_area", [{}])[0]
-        city = area.get("areaName", [{}])[0].get("value", location)
-        country = area.get("country", [{}])[0].get("value", "")
-        desc = current.get("weatherDesc", [{}])[0].get("value", "")
-        temp_c = current.get("temp_C", "?")
-        temp_f = current.get("temp_F", "?")
-        humidity = current.get("humidity", "?")
-        wind = current.get("windspeedMiles", "?")
-        return f"{city}, {country}: {desc}, {temp_c}C ({temp_f}F), Humidity: {humidity}%, Wind: {wind} mph"
-    except Exception as e:
-        return f"Weather error: {e}"
-
-
-_LOCAL_TOOLS = {
-    "web_search": tool_web_search,
-    "read_url": tool_read_url,
-    "calculate": tool_calculate,
-    "datetime": tool_datetime,
-    "weather": tool_weather,
-}
-
-# ---------------------------------------------------------------------------
-# Tool detection — figure out what tools to use before calling the LLM
-# ---------------------------------------------------------------------------
-
-def detect_tools(message: str) -> list[tuple[str, dict]]:
-    """Detect which tools to run based on the user's message."""
-    msg = message.lower().strip()
-    tools_to_run = []
-
-    # Web search triggers
-    search_patterns = [
-        r"(?:search|look up|find|google|what is|who is|what are|tell me about|latest|news|how to|where is|when did|when was|when is)",
-        r"(?:what(?:'s| is) (?:the |a )?(?:latest|current|new|best|price|cost|weather))",
-        r"(?:how (?:much|many|long|far|old))",
-        r"(?:can you (?:find|search|look))",
-    ]
-    needs_search = any(re.search(p, msg) for p in search_patterns)
-
-    # URL in message
-    url_match = re.search(r'(https?://\S+)', message)
-
-    # Math triggers
-    math_patterns = [
-        r"(?:calculate|compute|what is \d|how much is \d|\d\s*[\+\-\*\/\^]\s*\d|solve|evaluate)",
-        r"(?:square root|sqrt|log|sin|cos|tan|factorial)",
-        r"(?:\d+\s*%\s*of\s*\d+)",
-    ]
-    needs_math = any(re.search(p, msg) for p in math_patterns)
-
-    # Date/time triggers
-    time_patterns = [r"(?:what time|what day|what date|current date|current time|today|right now)"]
-    needs_time = any(re.search(p, msg) for p in time_patterns)
-
-    # Weather triggers
-    weather_match = re.search(r"weather (?:in|for|at) (.+?)(?:\?|$|\.)", msg)
-    if not weather_match:
-        weather_match = re.search(r"(?:temperature|forecast) (?:in|for|at) (.+?)(?:\?|$|\.)", msg)
-
-    if url_match:
-        tools_to_run.append(("read_url", {"url": url_match.group(1)}))
-    if needs_search:
-        # Extract the search query - use the whole message cleaned up
-        query = re.sub(r"(?:please |can you |could you |search for |look up |find |google |tell me about )", "", msg).strip("?. ")
-        tools_to_run.append(("web_search", {"query": query}))
-    if needs_math:
-        expr_match = re.search(r'[\d][\d\s\+\-\*\/\^\(\)\.%]+[\d\)]', message)
-        if expr_match:
-            tools_to_run.append(("calculate", {"expression": expr_match.group(0)}))
-    if needs_time:
-        tools_to_run.append(("datetime", {}))
-    if weather_match:
-        tools_to_run.append(("weather", {"location": weather_match.group(1).strip()}))
-
-    return tools_to_run
-
-
-_SYNC_TOOLS = {"calculate", "datetime"}
-_ASYNC_TOOLS = {"web_search", "read_url", "weather"}
-
-
-def run_tools(tools_to_run: list[tuple[str, dict]]) -> dict[str, str]:
-    """Run tools and return results.
-    Math/date tools run synchronously; web/fetch tools run in parallel."""
-    results = {}
-
-    def run_one(name, kwargs):
-        fn = _LOCAL_TOOLS[name]
-        try:
-            result = fn(**kwargs)
-            return name, result
-        except Exception as e:
-            return name, f"Error: {e}"
-
-    # Split into sync (fast, no I/O) and async (network)
-    sync_tools = [(n, kw) for n, kw in tools_to_run if n in _SYNC_TOOLS]
-    async_tools = [(n, kw) for n, kw in tools_to_run if n in _ASYNC_TOOLS]
-    other_tools = [(n, kw) for n, kw in tools_to_run if n not in _SYNC_TOOLS and n not in _ASYNC_TOOLS]
-
-    for name, kwargs in sync_tools + other_tools:
-        name_out, result = run_one(name, kwargs)
-        results[name_out] = result
-
-    if async_tools:
-        with ThreadPoolExecutor(max_workers=3) as pool:
-            futures = [pool.submit(run_one, name, kwargs) for name, kwargs in async_tools]
-            for future in futures:
-                name_out, result = future.result()
-                results[name_out] = result
-
-    return results
-
-
-# ---------------------------------------------------------------------------
-# System prompt — makes the small model much smarter
-# ---------------------------------------------------------------------------
-
-SYSTEM_PROMPT = """You are a helpful, accurate, and concise AI assistant. You have access to real-time information through tools that have already been run for you.
-
-Rules:
-- Answer the user's question directly and concisely
-- When tool results are provided, USE them to give an accurate, up-to-date answer
-- If search results are provided, synthesize the information into a clear answer — don't just list the results
-- If you don't know something and no tool results are available, say so honestly
-- Keep responses focused and to the point
-- For math questions, use the calculation result provided
-- For date/time questions, use the datetime result provided
-- When citing information from search results, be specific"""
-
-
-def build_prompt(user_message: str, tool_results: dict[str, str], conversation: list[dict]) -> list[dict]:
-    """Build the full prompt with tool results and personalized user context injected."""
-    parts = [SYSTEM_PROMPT]
-
-    # Inject personalized user context
-    if _PROFILE_AVAILABLE:
-        profile = get_profile()
-        user_ctx = profile.system_context(service="smart-ollama") if profile else ""
-        if user_ctx:
-            parts.append(f"\n{user_ctx}")
-
-    # Add tool capabilities description for models without native tool support
-    if _PROFILE_AVAILABLE:
-        parts.append(build_tool_system_prompt())
-
-    # Add current date for context
-    parts.append(f"\nCurrent date: {datetime.datetime.now().strftime('%Y-%m-%d %A')}")
-
-    # Add tool results as context
-    if tool_results:
-        parts.append("\n--- TOOL RESULTS (use these to answer the user) ---")
-        for tool_name, result in tool_results.items():
-            parts.append(f"\n[{tool_name}]:\n{result}")
-        parts.append("\n--- END TOOL RESULTS ---")
-
-    system = "\n".join(parts)
-
-    # Build messages for Ollama
-    messages = [{"role": "system", "content": system}]
-
-    # Add conversation history
-    for msg in conversation:
-        messages.append(msg)
-
-    # Add current user message
-    messages.append({"role": "user", "content": user_message})
-
-    return messages
-
-
-# ---------------------------------------------------------------------------
-# Ollama call
-# ---------------------------------------------------------------------------
-
-def _is_cloud_model(model: str) -> bool:
-    """Return True if this model should be routed to Ollama cloud.
-    Any model with a ':cloud' suffix is considered a cloud model.
-    """
-    return model.endswith(":cloud")
-
-
-def _ollama_headers(cloud: bool = False) -> dict:
-    """Build headers for Ollama requests. Adds Authorization for cloud."""
-    headers = {"Content-Type": "application/json"}
-    if cloud and OLLAMA_API_KEY:
-        headers["Authorization"] = f"Bearer {OLLAMA_API_KEY}"
-    return headers
-
-
-def call_ollama(messages: list[dict], model: str, stream: bool = False) -> "str | Response":
-    """Call Ollama's chat API (local or cloud).
-    Routes :cloud models to OLLAMA_CLOUD_URL with Authorization header.
-    Non-streaming retries up to 2 times on 503/connection errors.
-    """
-    cloud = _is_cloud_model(model)
-    base_url = OLLAMA_CLOUD_URL if cloud else OLLAMA_URL
-    session = _cloud_session if cloud else _ollama_session
-    headers = _ollama_headers(cloud)
-
-    payload = {
-        "model": model,
-        "messages": messages,
-        "stream": stream,
-        "options": {
-            "temperature": 0.7,
-            "num_predict": 1024,
-        },
-    }
-
-    if stream:
-        def generate():
-            try:
-                r = session.post(
-                    f"{base_url}/api/chat",
-                    json=payload,
-                    headers=headers,
-                    stream=True,
-                    timeout=OLLAMA_TIMEOUT,
-                )
-                try:
-                    for line in r.iter_lines():
-                        if line:
-                            chunk = json.loads(line)
-                            token = chunk.get("message", {}).get("content", "")
-                            if token:
-                                yield f"data: {json.dumps({'content': token})}\n\n"
-                            if chunk.get("done"):
-                                yield f"data: {json.dumps({'content': '', 'done': True})}\n\n"
-                except Exception:
-                    yield f"data: {json.dumps({'error': 'Stream interrupted'})}\n\n"
-            except requests.exceptions.Timeout:
-                yield f"data: {json.dumps({'error': 'Ollama request timed out after 120 seconds'})}\n\n"
-            except Exception as e:
-                yield f"data: {json.dumps({'error': str(e)})}\n\n"
-
-        return Response(stream_with_context(generate()), mimetype="text/event-stream")
-    else:
-        last_err = None
-        for attempt in range(3):
-            try:
-                r = session.post(
-                    f"{base_url}/api/chat",
-                    json=payload,
-                    headers=headers,
-                    timeout=OLLAMA_TIMEOUT,
-                )
-                if r.status_code == 503 and attempt < 2:
-                    time.sleep(1)
-                    last_err = "Ollama returned 503"
-                    continue
-                if r.status_code == 401:
-                    raise PermissionError(f"Ollama auth failed (cloud={cloud}). Check OLLAMA_API_KEY.")
-                data = r.json()
-                return data.get("message", {}).get("content", "No response from model")
-            except (PermissionError, TimeoutError):
-                raise
-            except requests.exceptions.Timeout:
-                raise TimeoutError("Ollama request timed out after 120 seconds")
-            except requests.exceptions.ConnectionError as e:
-                last_err = str(e)
-                if attempt < 2:
-                    time.sleep(1)
-                    continue
-            except Exception as e:
-                return f"Ollama error: {e}"
-        raise TimeoutError(f"Ollama unreachable after 3 attempts: {last_err}")
-
-
-# ---------------------------------------------------------------------------
-# Groq — fast cloud reasoning
-# ---------------------------------------------------------------------------
-
-def call_groq(messages: list[dict], stream: bool = False) -> "str | Response":
-    """Call Groq API (OpenAI-compatible). Falls back to local deepseek on failure."""
-    if not GROQ_API_KEY:
-        return call_ollama(messages, DEFAULT_MODEL, stream=stream)
-
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {GROQ_API_KEY}",
-    }
-    payload = {
-        "model": GROQ_MODEL,
-        "messages": messages,
-        "stream": stream,
-        "max_tokens": 4096,
-        "temperature": 0.6,
-    }
-
-    if stream:
-        def generate():
-            try:
-                r = requests.post(GROQ_URL, json=payload, headers=headers,
-                                  stream=True, timeout=30)
-                for line in r.iter_lines():
-                    if not line:
-                        continue
-                    raw = line.decode() if isinstance(line, bytes) else line
-                    if raw.startswith("data: "):
-                        raw = raw[6:]
-                    if raw.strip() == "[DONE]":
-                        break
-                    try:
-                        chunk = json.loads(raw)
-                        token = chunk["choices"][0]["delta"].get("content", "")
-                        if token:
-                            yield json.dumps({"message": {"content": token}}) + "\n"
-                    except Exception:
-                        continue
-            except Exception as e:
-                yield json.dumps({"message": {"content": f"[Groq error: {e}]"}}) + "\n"
-        return Response(generate(), mimetype="application/x-ndjson")
-
-    try:
-        r = requests.post(GROQ_URL, json=payload, headers=headers, timeout=60)
-        r.raise_for_status()
-        return r.json()["choices"][0]["message"]["content"]
-    except Exception as e:
-        # Fall back to local model on Groq failure
-        return call_ollama(messages, DEFAULT_MODEL, stream=False)
-
-
-# ---------------------------------------------------------------------------
-# Cerebras — primary cloud reasoning (235B MoE)
-# ---------------------------------------------------------------------------
-
-def call_cerebras(messages: list[dict], large: bool = True, stream: bool = False) -> "str | Response":
-    """Call Cerebras API. Falls back to Groq, then local deepseek on failure."""
-    if not CEREBRAS_API_KEY:
-        return call_groq(messages, stream=stream)
-
-    model = CEREBRAS_MODEL_LARGE if large else CEREBRAS_MODEL_FAST
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {CEREBRAS_API_KEY}",
-    }
-    payload = {
-        "model": model,
-        "messages": messages,
-        "stream": stream,
-        "max_completion_tokens": 4096,
-        "temperature": 0.6,
-    }
-
-    if stream:
-        def generate():
-            try:
-                r = requests.post(CEREBRAS_URL, json=payload, headers=headers,
-                                  stream=True, timeout=30)
-                for line in r.iter_lines():
-                    if not line:
-                        continue
-                    raw = line.decode() if isinstance(line, bytes) else line
-                    if raw.startswith("data: "):
-                        raw = raw[6:]
-                    if raw.strip() == "[DONE]":
-                        break
-                    try:
-                        chunk = json.loads(raw)
-                        token = chunk["choices"][0]["delta"].get("content", "")
-                        if token:
-                            yield json.dumps({"message": {"content": token}}) + "\n"
-                    except Exception:
-                        continue
-            except Exception:
-                # Fall back to Groq on Cerebras failure
-                yield from _groq_stream_fallback(messages)
-        return Response(generate(), mimetype="application/x-ndjson")
-
-    try:
-        r = requests.post(CEREBRAS_URL, json=payload, headers=headers, timeout=60)
-        r.raise_for_status()
-        return r.json()["choices"][0]["message"]["content"]
-    except Exception:
-        return call_groq(messages, stream=False)
-
-
-def _groq_stream_fallback(messages):
-    """Used internally when Cerebras streaming fails mid-stream."""
-    try:
-        result = call_groq(messages, stream=False)
-        yield json.dumps({"message": {"content": result}}) + "\n"
-    except Exception:
-        pass
-
-
-# ---------------------------------------------------------------------------
-# vllm / InternVL2-26B vision call
-# ---------------------------------------------------------------------------
-
-def call_vllm_vision(messages: list[dict], stream: bool = False) -> "str | Response":
-    """Call the vllm OpenAI-compatible endpoint with InternVL2-26B."""
-    payload = {
-        "model": VLLM_VISION_MODEL,
-        "messages": messages,
-        "stream": stream,
-        "max_tokens": 1024,
-        "temperature": 0.7,
-    }
-
-    if stream:
-        def generate():
-            try:
-                r = _vllm_session.post(
-                    f"{VLLM_VISION_URL}/chat/completions",
-                    json=payload,
-                    stream=True,
-                    timeout=OLLAMA_TIMEOUT,
-                )
-                for line in r.iter_lines():
-                    if not line:
-                        continue
-                    text = line.decode("utf-8") if isinstance(line, bytes) else line
-                    if text.startswith("data: "):
-                        text = text[6:]
-                    if text.strip() == "[DONE]":
-                        yield f"data: {json.dumps({'content': '', 'done': True})}\n\n"
-                        break
-                    try:
-                        chunk = json.loads(text)
-                        token = chunk.get("choices", [{}])[0].get("delta", {}).get("content", "")
-                        if token:
-                            yield f"data: {json.dumps({'content': token})}\n\n"
-                    except Exception:
-                        pass
-            except requests.exceptions.Timeout:
-                yield f"data: {json.dumps({'error': 'vllm request timed out'})}\n\n"
-            except Exception as e:
-                yield f"data: {json.dumps({'error': str(e)})}\n\n"
-
-        return Response(stream_with_context(generate()), mimetype="text/event-stream")
-    else:
-        try:
-            r = _vllm_session.post(
-                f"{VLLM_VISION_URL}/chat/completions",
-                json=payload,
-                timeout=OLLAMA_TIMEOUT,
-            )
-            if r.status_code != 200:
-                raise RuntimeError(f"vllm returned HTTP {r.status_code}: {r.text[:200]}")
-            data = r.json()
-            return data["choices"][0]["message"]["content"]
-        except (RuntimeError, KeyError) as e:
-            raise RuntimeError(f"vllm error: {e}") from e
-        except requests.exceptions.Timeout:
-            raise TimeoutError("vllm request timed out")
-
-
-def _messages_have_image(messages: list[dict]) -> bool:
-    """Return True if any message contains an image_url content part."""
-    for msg in messages:
-        content = msg.get("content", "")
-        if isinstance(content, list):
-            for part in content:
-                if isinstance(part, dict) and part.get("type") == "image_url":
-                    return True
-    return False
-
+# Tools, search, model backends → tools.py and model_backends.py
 
 # ---------------------------------------------------------------------------
 # API Routes
@@ -1991,17 +1322,15 @@ def voice_chat():
     if not transcript:
         return jsonify({"error": "Could not transcribe audio"}), 400
 
-    # Step 2: get AI response (reuse chat logic)
-    key_row = g.get("api_key_row") or {}
-    tier    = key_row.get("tier", "free") if key_row else "free"
-
-    model   = DEFAULT_MODEL
+    # Step 2: get AI response
+    tier  = getattr(g, "user_tier", "free")
+    model = DEFAULT_MODEL
     if tier == "premium" and CEREBRAS_API_KEY:
-        ai_text = _call_cerebras_stream_collect(transcript)
+        ai_text = collect_cerebras(transcript)
     elif GROQ_API_KEY:
-        ai_text = _call_groq_collect(transcript)
+        ai_text = collect_groq(transcript)
     else:
-        ai_text = _ollama_generate_collect(transcript, model)
+        ai_text = collect_ollama(transcript, model)
 
     # Step 3: TTS the response
     try:
@@ -2021,45 +1350,7 @@ def voice_chat():
     })
 
 
-def _call_cerebras_stream_collect(prompt: str) -> str:
-    """Non-streaming Cerebras call, returns full text."""
-    try:
-        import urllib.request as _ur, json as _j
-        payload = _j.dumps({"model": CEREBRAS_MODEL_LARGE,
-                             "messages": [{"role": "user", "content": prompt}],
-                             "max_tokens": 1024, "stream": False}).encode()
-        req = _ur.Request(CEREBRAS_URL, data=payload,
-                          headers={"Authorization": f"Bearer {CEREBRAS_API_KEY}",
-                                   "Content-Type": "application/json"}, method="POST")
-        with _ur.urlopen(req, timeout=30) as resp:
-            return _j.loads(resp.read())["choices"][0]["message"]["content"]
-    except Exception:
-        return _ollama_generate_collect(prompt, DEFAULT_MODEL)
-
-def _call_groq_collect(prompt: str) -> str:
-    try:
-        import urllib.request as _ur, json as _j
-        payload = _j.dumps({"model": GROQ_MODEL,
-                             "messages": [{"role": "user", "content": prompt}],
-                             "max_tokens": 1024}).encode()
-        req = _ur.Request(GROQ_URL, data=payload,
-                          headers={"Authorization": f"Bearer {GROQ_API_KEY}",
-                                   "Content-Type": "application/json"}, method="POST")
-        with _ur.urlopen(req, timeout=30) as resp:
-            return _j.loads(resp.read())["choices"][0]["message"]["content"]
-    except Exception:
-        return _ollama_generate_collect(prompt, DEFAULT_MODEL)
-
-def _ollama_generate_collect(prompt: str, model: str) -> str:
-    try:
-        import urllib.request as _ur, json as _j
-        payload = _j.dumps({"model": model, "prompt": prompt, "stream": False}).encode()
-        req = _ur.Request(f"{OLLAMA_URL}/api/generate", data=payload,
-                          headers={"Content-Type": "application/json"}, method="POST")
-        with _ur.urlopen(req, timeout=60) as resp:
-            return _j.loads(resp.read()).get("response", "")
-    except Exception as e:
-        return f"Error: {e}"
+# Voice collect helpers → model_backends.collect_cerebras / collect_groq / collect_ollama
 
 
 # ---------------------------------------------------------------------------
