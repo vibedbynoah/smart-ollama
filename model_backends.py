@@ -28,6 +28,39 @@ FAST_MODEL          = os.environ.get("OLLAMA_FAST_MODEL",   _UNIFIED)
 SMART_MODEL         = os.environ.get("OLLAMA_SMART_MODEL",  "minimax-m2.5:cloud")
 VISION_LOCAL_MODEL  = os.environ.get("OLLAMA_VISION_MODEL", _UNIFIED)
 
+
+def resolve_best_local_model() -> str:
+    """Return the best text/vision model currently installed in Ollama.
+
+    Priority order ensures we use a capable model that's actually available
+    rather than blindly defaulting to a model that may not be installed.
+    """
+    _candidates = [
+        os.environ.get("OLLAMA_MODEL", ""),
+        "qwen2.5vl:7b",
+        "qwen2.5vl:7b-q4_K_M",
+        "noahmrauch/qwen2.5vl:7b-q4_K_M",
+        "qwen2.5:0.5b",
+        "moondream:latest",
+        "tcg-grader:latest",
+    ]
+    try:
+        resp = requests.get(f"{OLLAMA_URL}/api/tags", timeout=5)
+        if resp.ok:
+            installed = {m["name"] for m in resp.json().get("models", [])}
+            for c in _candidates:
+                if c and c in installed:
+                    return c
+            # Fuzzy: any qwen2.5 variant
+            for name in installed:
+                if "qwen2.5vl" in name:
+                    return name
+            if installed:
+                return next(iter(installed))
+    except Exception:
+        pass
+    return _UNIFIED
+
 GROQ_API_KEY        = os.environ.get("GROQ_API_KEY",        "")
 GROQ_MODEL          = os.environ.get("GROQ_MODEL",          "llama-3.3-70b-versatile")
 GROQ_URL            = "https://api.groq.com/openai/v1/chat/completions"

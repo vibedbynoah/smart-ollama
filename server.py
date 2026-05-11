@@ -48,7 +48,12 @@ from model_backends import (
     OLLAMA_URL, VLLM_VISION_URL, VLLM_VISION_MODEL,
     GROQ_API_KEY, GROQ_MODEL, CEREBRAS_API_KEY, CEREBRAS_MODEL_LARGE,
     _ollama_session, _vllm_session,
+    resolve_best_local_model,
 )
+
+# Resolve the best actually-installed model at startup so routing never
+# silently picks a model that isn't installed.
+_BEST_LOCAL_MODEL = resolve_best_local_model()
 
 from tcg.cv_grader import grade_card_image
 from tcg.card_identifier import identify_card, CardIdentity, search_ebay_listings, get_beckett_prices
@@ -92,7 +97,8 @@ CEREBRAS_MODEL_FAST = os.environ.get("CEREBRAS_MODEL_FAST", "llama3.1-8b")
 CEREBRAS_URL = "https://api.cerebras.ai/v1/chat/completions"
 GROQ_URL     = "https://api.groq.com/openai/v1/chat/completions"
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "smart_ollama.db")
+_DATA_DIR = os.environ.get("CARD_GRADER_DATA_DIR", os.path.dirname(__file__))
+DB_PATH = os.path.join(_DATA_DIR, "smart_ollama.db")
 
 # Sessions and search tools live in tools.py / model_backends.py
 
@@ -547,7 +553,7 @@ def chat():
         elif is_premium and GROQ_API_KEY:
             model = "__groq__"
         else:
-            model = SMART_MODEL if OLLAMA_API_KEY else DEFAULT_MODEL
+            model = SMART_MODEL if OLLAMA_API_KEY else _BEST_LOCAL_MODEL
     elif model_choice in ("default", "auto"):
         if has_image:
             model = "__vllm__"
@@ -557,11 +563,11 @@ def chat():
             elif is_premium and GROQ_API_KEY:
                 model = "__groq__"
             else:
-                model = DEFAULT_MODEL  # free tier: local deepseek
+                model = _BEST_LOCAL_MODEL  # free tier: best available local model
         elif len(user_message) < 80 and not _TOOL_KEYWORDS.search(user_message):
-            model = FAST_MODEL
+            model = _BEST_LOCAL_MODEL
         else:
-            model = FAST_MODEL
+            model = _BEST_LOCAL_MODEL
     else:
         # Raw model name requested — block premium models for free tier
         _PREMIUM_MODELS = {"__cerebras__", "__groq__", CEREBRAS_MODEL_LARGE, CEREBRAS_MODEL_FAST, GROQ_MODEL}
@@ -569,10 +575,10 @@ def chat():
             return jsonify({"error": "This model requires a premium subscription."}), 403
         model = model_choice
 
-    # Vision models must never be used for text-only chat
-    _VISION_ONLY_MODELS = {"moondream:latest", "moondream", "qwen2.5vl:7b", "qwen2.5vl:3b"}
+    # Vision-only models must not be used for text-only chat — fall back to best text model
+    _VISION_ONLY_MODELS = {"moondream:latest", "moondream", "qwen2.5vl:3b"}
     if model in _VISION_ONLY_MODELS and not has_image:
-        model = FAST_MODEL
+        model = _BEST_LOCAL_MODEL
 
     # Model whitelist validation — reject unknown raw model names (skip cloud + vllm pseudo-model)
     if model_choice not in ("fast", "smart", "default", "auto") and model != "__vllm__":
@@ -956,7 +962,7 @@ Provide your grading assessment as JSON."""
             "model": "tcg-grader",
             "messages": [{"role": "user", "content": ai_prompt}],
             "stream": False,
-            "options": {"temperature": 0.1, "num_predict": 512},
+            "options": {"temperature": 0.1, "num_predict": 512, "num_gpu": 99},
         }, timeout=60)
         ai_text = r.json().get("message", {}).get("content", "")
         # Try to parse JSON from response
@@ -1063,7 +1069,7 @@ def _is_card_image(img_data):
                     "prompt": card_prompt,
                     "images": [b64],
                     "stream": False,
-                    "options": {"temperature": 0.0, "num_predict": 10, "num_ctx": 512},
+                    "options": {"temperature": 0.0, "num_predict": 10, "num_ctx": 512, "num_gpu": 99},
                 },
                 timeout=15,
             )
