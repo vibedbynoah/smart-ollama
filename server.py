@@ -440,13 +440,14 @@ def health():
     except Exception:
         pass
 
-    # Check vllm reachability
+    # Check vllm reachability (skip when no URL configured — vLLM is opt-in)
     vllm_reachable = False
-    try:
-        rv = _vllm_session.get(f"{VLLM_VISION_URL}/models", timeout=3)
-        vllm_reachable = rv.status_code == 200
-    except Exception:
-        pass
+    if VLLM_VISION_URL:
+        try:
+            rv = _vllm_session.get(f"{VLLM_VISION_URL}/models", timeout=3)
+            vllm_reachable = rv.status_code == 200
+        except Exception:
+            pass
 
     # DB size
     db_size_bytes = 0
@@ -1391,16 +1392,19 @@ if __name__ == "__main__":
     except Exception:
         print(f"  WARNING: Ollama not reachable at {OLLAMA_URL}")
 
-    # Verify vllm
-    try:
-        rv = _vllm_session.get(f"{VLLM_VISION_URL}/models", timeout=3)
-        if rv.status_code == 200:
-            vllm_models = [m["id"] for m in rv.json().get("data", [])]
-            print(f"  vllm OK — vision model: {', '.join(vllm_models) or VLLM_VISION_MODEL}")
-        else:
-            print(f"  WARNING: vllm returned HTTP {rv.status_code} at {VLLM_VISION_URL}")
-    except Exception:
-        print(f"  WARNING: vllm not reachable at {VLLM_VISION_URL} (vision endpoint will be unavailable)")
+    # Verify vllm (skip when no URL configured — vLLM is opt-in)
+    if VLLM_VISION_URL:
+        try:
+            rv = _vllm_session.get(f"{VLLM_VISION_URL}/models", timeout=3)
+            if rv.status_code == 200:
+                vllm_models = [m["id"] for m in rv.json().get("data", [])]
+                print(f"  vllm OK — vision model: {', '.join(vllm_models) or VLLM_VISION_MODEL}")
+            else:
+                print(f"  WARNING: vllm returned HTTP {rv.status_code} at {VLLM_VISION_URL}")
+        except Exception:
+            print(f"  WARNING: vllm not reachable at {VLLM_VISION_URL} (vision endpoint will be unavailable)")
+    else:
+        print("  vllm: not configured (VLLM_VISION_URL empty) — using Ollama vision only")
 
     # Create TCG grader Ollama model
     print("  Creating TCG grader model...")

@@ -19,7 +19,7 @@ OLLAMA_URL          = os.environ.get("OLLAMA_URL",          "http://localhost:11
 OLLAMA_CLOUD_URL    = os.environ.get("OLLAMA_CLOUD_URL",    "https://ollama.com/api")
 OLLAMA_API_KEY      = os.environ.get("OLLAMA_API_KEY",      "")
 OLLAMA_TIMEOUT      = int(os.environ.get("OLLAMA_TIMEOUT",  "60"))
-VLLM_VISION_URL     = os.environ.get("VLLM_VISION_URL",     "http://localhost:8000/v1")
+VLLM_VISION_URL     = os.environ.get("VLLM_VISION_URL",     "")  # opt-in; empty disables vLLM probes
 VLLM_VISION_MODEL   = os.environ.get("VLLM_VISION_MODEL",   "OpenGVLab/InternVL2-26B")
 
 _UNIFIED            = os.environ.get("OLLAMA_MODEL",        "qwen2.5vl:7b")
