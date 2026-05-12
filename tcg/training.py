@@ -452,14 +452,27 @@ def is_idle():
 
 def _trainer_loop():
     global _trainer_running
+    empty_streak = 0
     while _trainer_running:
         try:
             if not is_idle():
-                print("[TCG Trainer] Skipping — server is active")
+                # Don't log skips at all; we run every TRAINING_INTERVAL anyway.
+                pass
             else:
                 result = run_training_cycle()
-                print(f"[TCG Trainer] Cycle complete: {result['entries_processed']} entries, "
-                      f"{result['labeled_entries']} labeled, {len(result['corrections'])} corrections")
+                processed = result["entries_processed"]
+                # Quiet empty cycles: only log when there's actual work, or once an
+                # hour to confirm the trainer is alive. Was spamming the log every
+                # 5 minutes with "0 entries, 0 labeled, 0 corrections" forever.
+                if processed > 0:
+                    empty_streak = 0
+                    print(f"[TCG Trainer] Cycle complete: {processed} entries, "
+                          f"{result['labeled_entries']} labeled, "
+                          f"{len(result['corrections'])} corrections")
+                else:
+                    empty_streak += 1
+                    if empty_streak % 12 == 1:  # ~ once per hour with 5-min cadence
+                        print(f"[TCG Trainer] No new entries for {empty_streak} cycle(s) — idle.")
         except Exception as e:
             print(f"[TCG Trainer] Error: {e}")
         time.sleep(TRAINING_INTERVAL)
